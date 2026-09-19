@@ -1,0 +1,249 @@
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.core.dependencies import get_current_user, require_role
+
+router = APIRouter(
+    prefix="/visits",
+    tags=["Visits"],
+)
+
+
+@router.post("/")
+def create_visit(
+    customer_id: str,
+    territory_id: str | None = None,
+    visit_date: str | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None,
+    location_accuracy_m: float | None = None,
+    visit_type: str = "CUSTOMER_VISIT",
+    status_value: str = "IN_PROGRESS",
+    notes: str | None = None,
+    current_user: dict = Depends(require_role("FIELD_REP", "MANAGER", "EXECUTIVE")),
+    db: Session = Depends(get_db),
+):
+    organization_id = current_user["organization_id"]
+    user_id = current_user["id"]
+
+    # Verify customer belongs to the same organization
+    customer = db.execute(
+        text("""
+            SELECT id, territory_id
+            FROM customers
+            WHERE id = :customer_id
+              AND organization_id = :organization_id
+            LIMIT 1
+        """),
+        {
+            "customer_id": customer_id,
+            "organization_id": organization_id,
+        },
+    ).mappings().first()
+
+    if not customer:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Customer not found in your organization.",
+        )
+
+    # If territory is supplied, verify it belongs to the same organization
+    if territory_id:
+        territory = db.execute(
+            text("""
+                SELECT id
+                FROM territories
+                WHERE id = :territory_id
+                  AND organization_id = :organization_id
+                LIMIT 1
+            """),
+            {
+                "territory_id": territory_id,
+                "organization_id": organization_id,
+            },
+        ).mappings().first()
+
+        if not territory:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Territory not found in your organization.",
+            )
+
+    # If no territory was supplied, use customer's territory
+    final_territory_id = territory_id or customer["territory_id"]
+
+    result = db.execute(
+        text("""
+            INSERT INTO visits (
+                organization_id,
+                customer_id,
+                territory_id,
+                user_id,
+                visit_date,
+                latitude,
+                longitude,
+                location_accuracy_m,
+                visit_type,
+                status,
+                notes
+            )
+            VALUES (
+                :organization_id,
+                :customer_id,
+                :territory_id,
+                :user_id,
+                COALESCE(CAST(:visit_date AS timestamptz), now()),
+                :latitude,
+                :longitude,
+                :location_accuracy_m,
+                :visit_type,
+                :status,
+                :notes
+            )
+            RETURNING
+                id,
+                organization_id,
+                customer_id,
+                territory_id,
+                user_id,
+                visit_date,
+                latitude,
+                longitude,
+                location_accuracy_m,
+                visit_type,
+                status,
+                notes,
+                created_at,
+                updated_at
+        """),
+        {
+            "organization_id": organization_id,
+            "customer_id": customer_id,
+            "territory_id": final_territory_id,
+            "user_id": user_id,
+            "visit_date": visit_date,
+            "latitude": latitude,
+            "longitude": longitude,
+            "location_accuracy_m": location_accuracy_m,
+            "visit_type": visit_type,
+            "status": status_value,
+            "notes": notes,
+        },
+    )
+
+    visit = result.mappings().first()
+    db.commit()
+
+    return {
+        "status": "success",
+        "visit": dict(visit),
+    }
+
+
+@router.get("/")
+def get_visits(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    organization_id = current_user["organization_id"]
+
+    result = db.execute(
+        text("""
+            SELECT
+                v.id,
+                v.organization_id,
+                v.customer_id,
+                c.name AS customer_name,
+                v.territory_id,
+                v.user_id,
+                u.full_name AS user_name,
+                v.visit_date,
+                v.latitude,
+                v.longitude,
+                v.location_accuracy_m,
+                v.visit_type,
+                v.status,
+                v.notes,
+                v.created_at,
+                v.updated_at
+            FROM visits v
+            JOIN customers c
+                ON c.id = v.customer_id
+            JOIN users u
+                ON u.id = v.user_id
+            WHERE v.organization_id = :organization_id
+            ORDER BY v.visit_date DESC
+        """),
+        {
+            "organization_id": organization_id,
+        },
+    )
+
+    visits = [
+        dict(row)
+        for row in result.mappings().all()
+    ]
+
+    return {
+        "status": "success",
+        "count": len(visits),
+        "visits": visits,
+    }
+
+
+@router.get("/{visit_id}")
+def get_visit(
+    visit_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    organization_id = current_user["organization_id"]
+
+    result = db.execute(
+        text("""
+            SELECT
+                v.id,
+                v.organization_id,
+                v.customer_id,
+                c.name AS customer_name,
+                v.territory_id,
+                v.user_id,
+                u.full_name AS user_name,
+                v.visit_date,
+                v.latitude,
+                v.longitude,
+                v.location_accuracy_m,
+                v.visit_type,
+                v.status,
+                v.notes,
+                v.created_at,
+                v.updated_at
+            FROM visits v
+            JOIN customers c
+                ON c.id = v.customer_id
+            JOIN users u
+                ON u.id = v.user_id
+            WHERE v.id = :visit_id
+              AND v.organization_id = :organization_id
+            LIMIT 1
+        """),
+        {
+            "visit_id": visit_id,
+            "organization_id": organization_id,
+        },
+    )
+
+    visit = result.mappings().first()
+
+    if not visit:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Visit not found.",
+        )
+
+    return {
+        "status": "success",
+        "visit": dict(visit),
+    }

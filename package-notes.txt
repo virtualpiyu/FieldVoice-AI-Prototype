@@ -1,0 +1,1 @@
+Prototype uses React/Vite/TypeScript + Expo/React Native. See README.md.

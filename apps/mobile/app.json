@@ -1,0 +1,19 @@
+{
+  "expo": {
+    "name": "FieldVoice AI",
+    "slug": "fieldvoice-ai",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#0b0609"
+    },
+    "android": {
+      "package": "com.fieldvoice.ai"
+    },
+    "ios": {
+      "bundleIdentifier": "com.fieldvoice.ai"
+    }
+  }
+}

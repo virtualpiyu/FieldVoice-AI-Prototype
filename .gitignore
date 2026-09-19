@@ -1,0 +1,55 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+**/.venv/
+venv/
+**/venv/
+env/
+
+# Node
+node_modules/
+**/node_modules/
+dist/
+build/
+
+# Expo / Mobile
+**/.expo/
+**/.gradle/
+**/android/.cxx/
+**/android/build/
+**/ios/Pods/
+
+# Vercel
+.vercel/
+**/.vercel/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local recordings / media
+*.mp3
+*.mp4
+*.wav
+*.webm
+*.m4a
+*.aac
+*.flac
+
+# Backend generated uploads
+backend/app/uploads/
+
+# TypeScript
+*.tsbuildinfo

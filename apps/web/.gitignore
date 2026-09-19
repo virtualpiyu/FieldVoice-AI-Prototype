@@ -1,0 +1,77 @@
+@"
+# =========================
+# SECRETS / ENVIRONMENT
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# PYTHON
+# =========================
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+**/.venv/
+venv/
+**/venv/
+env/
+
+# =========================
+# NODE / JAVASCRIPT
+# =========================
+node_modules/
+**/node_modules/
+dist/
+build/
+
+# =========================
+# EXPO / MOBILE
+# =========================
+**/.expo/
+**/.gradle/
+**/android/.cxx/
+**/android/build/
+**/ios/Pods/
+
+# =========================
+# VERCEL
+# =========================
+.vercel/
+**/.vercel/
+
+# =========================
+# IDE
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# OS
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# LOCAL AUDIO / VIDEO
+# =========================
+*.mp3
+*.mp4
+*.wav
+*.webm
+*.m4a
+*.aac
+*.flac
+
+# =========================
+# BACKEND GENERATED FILES
+# =========================
+backend/app/uploads/
+
+# =========================
+# TYPESCRIPT
+# =========================
+*.tsbuildinfo
+"@ | Set-Content -Encoding UTF8 .gitignore
