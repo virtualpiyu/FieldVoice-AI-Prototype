@@ -272,23 +272,77 @@ async def upload_voice_note(
     # -----------------------------------------
     # AI ANALYSIS
     # -----------------------------------------
+    # IMPORTANT: AI generation and DB side-effects are deliberately separated.
+    # A failure while creating a lead/action/alert must NEVER erase a valid
+    # AI analysis or make the frontend think that Gemini failed.
+
+    analysis_start = time.perf_counter()
 
     try:
+        ai_analysis = analyze_transcription(transcription)
+    except Exception as e:
+        # Keep the voice note/transcript usable even if the AI provider fails.
+        return {
+            "status": "partial_success",
+            "message": "Voice note uploaded and transcribed, but AI analysis could not be generated.",
+            "voice_note": dict(voice_note),
+            "transcription": transcription,
+            "ai_analysis": None,
+            "analysis_error": str(e),
+        }
 
-        analysis_start = time.perf_counter()
+    processing_time_ms = int(
+        (time.perf_counter() - analysis_start) * 1000
+    )
 
-        ai_analysis = analyze_transcription(
-            transcription
-        )
+    # Normalize the AI payload before writing it to PostgreSQL. This guarantees
+    # the frontend always receives arrays instead of null/string surprises.
+    ai_analysis = {
+        "summary": str(ai_analysis.get("summary") or "Field visit recorded.").strip(),
+        "sentiment": str(ai_analysis.get("sentiment") or "NEUTRAL").upper(),
+        "key_insights": [
+            str(x).strip()
+            for x in (ai_analysis.get("key_insights") or [])
+            if str(x).strip()
+        ],
+        "action_items": [
+            str(x).strip()
+            for x in (ai_analysis.get("action_items") or [])
+            if str(x).strip()
+        ],
+        "alerts": [
+            str(x).strip()
+            for x in (ai_analysis.get("alerts") or [])
+            if str(x).strip()
+        ],
+        "opportunity_signal": str(
+            ai_analysis.get("opportunity_signal") or "LOW"
+        ).upper(),
+        "risk_signal": str(
+            ai_analysis.get("risk_signal") or "LOW"
+        ).upper(),
+    }
 
-        processing_time_ms = int(
-            (time.perf_counter() - analysis_start) * 1000
-        )
+    # The AI service already has a transcript-grounded fallback. This is an
+    # additional safety net so the product never displays an empty Key Insights
+    # section for a non-empty transcript.
+    if transcription.strip() and not ai_analysis["key_insights"]:
+        ai_analysis["key_insights"] = [
+            "The field visit transcript was analyzed, but no separate insight was explicitly extracted."
+        ]
 
-        # -----------------------------------------
-        # SAVE AI INSIGHT
-        # -----------------------------------------
+    ai_insight_id = None
+    lead_id = None
+    lead_created = False
+    persistence_error = None
+    side_effect_errors = []
 
+    # -----------------------------------------
+    # SAVE AI INSIGHT FIRST
+    # -----------------------------------------
+    # Commit this independently. This is the critical bug fix: failures in
+    # leads/action-items/alerts must not rollback the core AI intelligence.
+    try:
         insight_result = db.execute(
             text("""
                 INSERT INTO ai_insights (
@@ -321,299 +375,277 @@ async def upload_voice_note(
                 "voice_note_id": voice_note["id"],
                 "visit_id": visit_id,
                 "organization_id": organization_id,
-                "summary": ai_analysis.get("summary"),
-                "sentiment": ai_analysis.get("sentiment"),
-                "key_insights": json.dumps(
-                    ai_analysis.get("key_insights", [])
-                ),
-                "opportunity_level": ai_analysis.get(
-                    "opportunity_signal"
-                ),
-                "risk_level": ai_analysis.get(
-                    "risk_signal"
-                ),
+                "summary": ai_analysis["summary"],
+                "sentiment": ai_analysis["sentiment"],
+                "key_insights": json.dumps(ai_analysis["key_insights"]),
+                "opportunity_level": ai_analysis["opportunity_signal"],
+                "risk_level": ai_analysis["risk_signal"],
                 "model_name": "gemini-3.8-flash",
                 "processing_time_ms": processing_time_ms,
             },
         )
+        row = insight_result.mappings().first()
+        if not row:
+            raise RuntimeError("AI insight insert returned no row.")
+        ai_insight_id = row["id"]
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        persistence_error = str(e)
 
-        ai_insight = insight_result.mappings().first()
+    # -----------------------------------------
+    # OPTIONAL CRM SIDE EFFECTS
+    # -----------------------------------------
+    # Each group is isolated. A failure here is reported separately but never
+    # changes the successful AI result returned to the frontend.
+    if ai_insight_id:
+        opportunity_signal = ai_analysis["opportunity_signal"]
 
-        ai_insight_id = ai_insight["id"]
-
-        # -----------------------------------------
-        # AUTOMATIC AI LEAD CREATION
-        # -----------------------------------------
-
-        lead_id = None
-        lead_created = False
-
-        opportunity_signal = (
-            ai_analysis.get("opportunity_signal") or ""
-        ).upper()
-
+        # Automatic lead creation for HIGH opportunity.
         if opportunity_signal == "HIGH":
-
-            # Check whether this customer already has
-            # an active lead in the organization
-            existing_lead = db.execute(
-                text("""
-                    SELECT id
-                    FROM leads
-                    WHERE organization_id = :organization_id
-                      AND customer_id = :customer_id
-                      AND stage NOT IN ('WON', 'LOST')
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                """),
-                {
-                    "organization_id": organization_id,
-                    "customer_id": visit["customer_id"],
-                },
-            ).mappings().first()
-
-            if not existing_lead:
-
-                customer = db.execute(
+            try:
+                existing_lead = db.execute(
                     text("""
-                        SELECT
-                            id,
-                            name,
-                            territory_id
-                        FROM customers
-                        WHERE id = :customer_id
-                          AND organization_id = :organization_id
+                        SELECT id
+                        FROM leads
+                        WHERE organization_id = :organization_id
+                          AND customer_id = :customer_id
+                          AND stage NOT IN ('WON', 'LOST')
+                        ORDER BY created_at DESC
                         LIMIT 1
                     """),
                     {
-                        "customer_id": visit["customer_id"],
                         "organization_id": organization_id,
+                        "customer_id": visit["customer_id"],
                     },
                 ).mappings().first()
 
-                if customer:
-
-                    lead_result = db.execute(
+                if not existing_lead:
+                    customer = db.execute(
                         text("""
-                            INSERT INTO leads (
-                                organization_id,
-                                customer_id,
-                                territory_id,
-                                assigned_to,
-                                title,
-                                description,
-                                stage,
-                                source,
-                                notes
-                            )
-                            VALUES (
-                                :organization_id,
-                                :customer_id,
-                                :territory_id,
-                                :assigned_to,
-                                :title,
-                                :description,
-                                'NEW',
-                                'AI_DETECTED',
-                                'Automatically created from HIGH AI opportunity signal.'
-                            )
-                            RETURNING id
+                            SELECT id, name, territory_id
+                            FROM customers
+                            WHERE id = :customer_id
+                              AND organization_id = :organization_id
+                            LIMIT 1
                         """),
                         {
+                            "customer_id": visit["customer_id"],
                             "organization_id": organization_id,
-                            "customer_id": customer["id"],
-                            "territory_id": customer["territory_id"],
-                            "assigned_to": user_id,
-                            "title": f"{customer['name']} Opportunity",
-                            "description": ai_analysis.get("summary"),
                         },
-                    )
+                    ).mappings().first()
 
-                    new_lead = lead_result.mappings().first()
+                    if customer:
+                        lead_result = db.execute(
+                            text("""
+                                INSERT INTO leads (
+                                    organization_id,
+                                    customer_id,
+                                    territory_id,
+                                    assigned_to,
+                                    title,
+                                    description,
+                                    stage,
+                                    source,
+                                    notes
+                                )
+                                VALUES (
+                                    :organization_id,
+                                    :customer_id,
+                                    :territory_id,
+                                    :assigned_to,
+                                    :title,
+                                    :description,
+                                    'NEW',
+                                    'AI_DETECTED',
+                                    'Automatically created from HIGH AI opportunity signal.'
+                                )
+                                RETURNING id
+                            """),
+                            {
+                                "organization_id": organization_id,
+                                "customer_id": customer["id"],
+                                "territory_id": customer["territory_id"],
+                                "assigned_to": user_id,
+                                "title": f"{customer['name']} Opportunity",
+                                "description": ai_analysis["summary"],
+                            },
+                        )
+                        new_lead = lead_result.mappings().first()
+                        if new_lead:
+                            lead_id = new_lead["id"]
 
-                    lead_id = new_lead["id"]
-                    lead_created = True
-
-                    # Record initial pipeline stage
-                    db.execute(
-                        text("""
-                            INSERT INTO lead_stage_history (
-                                lead_id,
-                                organization_id,
-                                from_stage,
-                                to_stage,
-                                changed_by,
-                                notes
+                            db.execute(
+                                text("""
+                                    INSERT INTO lead_stage_history (
+                                        lead_id,
+                                        organization_id,
+                                        from_stage,
+                                        to_stage,
+                                        changed_by,
+                                        notes
+                                    )
+                                    VALUES (
+                                        :lead_id,
+                                        :organization_id,
+                                        NULL,
+                                        'NEW',
+                                        :changed_by,
+                                        'Lead automatically created from AI opportunity detection.'
+                                    )
+                                """),
+                                {
+                                    "lead_id": lead_id,
+                                    "organization_id": organization_id,
+                                    "changed_by": user_id,
+                                },
                             )
-                            VALUES (
-                                :lead_id,
-                                :organization_id,
-                                NULL,
-                                'NEW',
-                                :changed_by,
-                                'Lead automatically created from AI opportunity detection.'
-                            )
-                        """),
-                        {
-                            "lead_id": lead_id,
-                            "organization_id": organization_id,
-                            "changed_by": user_id,
-                        },
-                    )
+                            db.commit()
+                            lead_created = True
+            except Exception as e:
+                db.rollback()
+                side_effect_errors.append(f"lead_creation: {e}")
 
-        # -----------------------------------------
-        # SAVE ACTION ITEMS
-        # -----------------------------------------
+        # AI action items.
+        for action in ai_analysis["action_items"]:
+            try:
+                db.execute(
+                    text("""
+                        INSERT INTO action_items (
+                            organization_id,
+                            visit_id,
+                            ai_insight_id,
+                            customer_id,
+                            assigned_to,
+                            title,
+                            description,
+                            priority,
+                            status,
+                            source
+                        )
+                        VALUES (
+                            :organization_id,
+                            :visit_id,
+                            :ai_insight_id,
+                            :customer_id,
+                            :assigned_to,
+                            :title,
+                            :description,
+                            'MEDIUM',
+                            'PENDING',
+                            'AI'
+                        )
+                    """),
+                    {
+                        "organization_id": organization_id,
+                        "visit_id": visit_id,
+                        "ai_insight_id": ai_insight_id,
+                        "customer_id": visit["customer_id"],
+                        "assigned_to": user_id,
+                        "title": action,
+                        "description": "AI-generated action item from field visit.",
+                    },
+                )
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                side_effect_errors.append(f"action_item: {e}")
 
-        for action in ai_analysis.get("action_items", []):
+        # AI alerts.
+        for alert in ai_analysis["alerts"]:
+            try:
+                db.execute(
+                    text("""
+                        INSERT INTO alerts (
+                            organization_id,
+                            visit_id,
+                            customer_id,
+                            ai_insight_id,
+                            assigned_to,
+                            alert_type,
+                            severity,
+                            title,
+                            message,
+                            status
+                        )
+                        VALUES (
+                            :organization_id,
+                            :visit_id,
+                            :customer_id,
+                            :ai_insight_id,
+                            NULL,
+                            'OTHER',
+                            'MEDIUM',
+                            'AI Field Sales Alert',
+                            :message,
+                            'OPEN'
+                        )
+                    """),
+                    {
+                        "organization_id": organization_id,
+                        "visit_id": visit_id,
+                        "customer_id": visit["customer_id"],
+                        "ai_insight_id": ai_insight_id,
+                        "message": alert,
+                    },
+                )
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                side_effect_errors.append(f"alert: {e}")
 
-            if not action:
-                continue
+    # -----------------------------------------
+    # FETCH COMPLETE VOICE NOTE
+    # -----------------------------------------
+    updated_result = db.execute(
+        text("""
+            SELECT
+                vn.id,
+                vn.visit_id,
+                vn.organization_id,
+                vn.user_id,
+                u.full_name AS user_name,
+                vn.file_url,
+                vn.file_name,
+                vn.file_type,
+                vn.file_size_bytes,
+                vn.duration_seconds,
+                vn.transcription,
+                vn.processing_status,
+                vn.transcription_confidence,
+                vn.recorded_at,
+                vn.created_at,
+                vn.updated_at
+            FROM voice_notes vn
+            JOIN users u ON u.id = vn.user_id
+            WHERE vn.id = :voice_note_id
+            LIMIT 1
+        """),
+        {"voice_note_id": voice_note["id"]},
+    )
+    updated_voice_note = updated_result.mappings().first() or voice_note
 
-            db.execute(
-                text("""
-                    INSERT INTO action_items (
-                        organization_id,
-                        visit_id,
-                        ai_insight_id,
-                        customer_id,
-                        assigned_to,
-                        title,
-                        description,
-                        priority,
-                        status,
-                        source
-                    )
-                    VALUES (
-                        :organization_id,
-                        :visit_id,
-                        :ai_insight_id,
-                        :customer_id,
-                        :assigned_to,
-                        :title,
-                        :description,
-                        'MEDIUM',
-                        'PENDING',
-                        'AI'
-                    )
-                """),
-                {
-                    "organization_id": organization_id,
-                    "visit_id": visit_id,
-                    "ai_insight_id": ai_insight_id,
-                    "customer_id": visit["customer_id"],
-                    "assigned_to": user_id,
-                    "title": str(action),
-                    "description": "AI-generated action item from field visit.",
-                },
-            )
+    response = {
+        "status": "success",
+        "message": "Voice note uploaded, transcribed, and analyzed successfully.",
+        "voice_note": dict(updated_voice_note),
+        "transcription": transcription,
+        "ai_analysis": ai_analysis,
+        "ai_insight_id": ai_insight_id,
+        "ai_insight_persisted": bool(ai_insight_id),
+        "lead_created": lead_created,
+        "lead_id": lead_id,
+    }
 
-        # -----------------------------------------
-        # SAVE ALERTS
-        # -----------------------------------------
+    if persistence_error:
+        response["ai_insight_persisted"] = False
+        response["analysis_persistence_error"] = persistence_error
+        response["message"] = "Voice note and AI analysis completed, but the AI insight could not be saved to the database."
 
-        for alert in ai_analysis.get("alerts", []):
+    if side_effect_errors:
+        response["side_effect_errors"] = side_effect_errors
 
-            if not alert:
-                continue
-
-            db.execute(
-                text("""
-                    INSERT INTO alerts (
-                        organization_id,
-                        visit_id,
-                        customer_id,
-                        ai_insight_id,
-                        assigned_to,
-                        alert_type,
-                        severity,
-                        title,
-                        message,
-                        status
-                    )
-                    VALUES (
-                        :organization_id,
-                        :visit_id,
-                        :customer_id,
-                        :ai_insight_id,
-                        :assigned_to,
-                        'OTHER',
-                        'MEDIUM',
-                        'AI Field Sales Alert',
-                        :message,
-                        'OPEN'
-                    )
-                """),
-                {
-                    "organization_id": organization_id,
-                    "visit_id": visit_id,
-                    "customer_id": visit["customer_id"],
-                    "ai_insight_id": ai_insight_id,
-                    "assigned_to": None,
-                    "message": str(alert),
-                },
-            )
-
-        db.commit()
-
-        # -----------------------------------------
-        # FETCH COMPLETE VOICE NOTE
-        # -----------------------------------------
-
-        updated_result = db.execute(
-            text("""
-                SELECT
-                    vn.id,
-                    vn.visit_id,
-                    vn.organization_id,
-                    vn.user_id,
-                    u.full_name AS user_name,
-                    vn.file_url,
-                    vn.file_name,
-                    vn.file_type,
-                    vn.file_size_bytes,
-                    vn.duration_seconds,
-                    vn.transcription,
-                    vn.processing_status,
-                    vn.transcription_confidence,
-                    vn.recorded_at,
-                    vn.created_at,
-                    vn.updated_at
-                FROM voice_notes vn
-                JOIN users u
-                    ON u.id = vn.user_id
-                WHERE vn.id = :voice_note_id
-                LIMIT 1
-            """),
-            {
-                "voice_note_id": voice_note["id"],
-            },
-        )
-
-        updated_voice_note = updated_result.mappings().first()
-
-        return {
-            "status": "success",
-            "message": "Voice note uploaded, transcribed, and analyzed successfully.",
-            "voice_note": dict(updated_voice_note),
-            "ai_analysis": ai_analysis,
-            "ai_insight_id": ai_insight_id,
-            "lead_created": lead_created,
-            "lead_id": lead_id,
-        }
-
-    except Exception as e:
-
-        db.rollback()
-
-        return {
-            "status": "success",
-            "message": "Voice note uploaded and transcribed, but AI analysis failed.",
-            "voice_note": dict(voice_note),
-            "transcription": transcription,
-            "analysis_error": str(e),
-        }
-
+    return response
 
 @router.get("/")
 def get_voice_notes(
