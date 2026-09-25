@@ -2,6 +2,7 @@ import os
 import time
 import subprocess
 import tempfile
+import shutil
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -20,13 +21,13 @@ TRANSCRIPTION_MODEL = "gemini-3.5-transcribe"
 MAX_WAIT_SECONDS = 90
 POLL_INTERVAL_SECONDS = 2
 
-# FFmpeg installed through WinGet on this machine.
-FFMPEG_PATH = os.getenv(
-    "FFMPEG_PATH",
-    r"C:\Users\kadam\AppData\Local\Microsoft\WinGet\Packages"
-    r"\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
-    r"\ffmpeg-9.0.1-full_build\bin\ffmpeg.exe",
-)
+# Resolve FFmpeg from environment or system PATH.
+FFMPEG_PATH = os.getenv("FFMPEG_PATH") or shutil.which("ffmpeg")
+
+if not FFMPEG_PATH:
+    raise RuntimeError(
+        "FFmpeg is not installed or FFMPEG_PATH is not configured."
+    )
 
 
 def _file_state_name(file_obj) -> str:
