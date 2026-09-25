@@ -5,6 +5,7 @@ import {
   ChevronRight, CircleUserRound, ClipboardCheck, Clock3, Eye, EyeOff, FileAudio,
   FileText, Flag, Gauge, Headphones, LayoutDashboard, Lightbulb, LogOut, MapPin,
   Menu, Mic, MicOff, Navigation, Play, Plus, Search, Send, Settings, ShieldCheck,
+  Sun, Moon, Palette, Database,
   Sparkles, Square, Target, TrendingUp, Users, WandSparkles, X, Zap, Building2,
   Phone, Globe, Star, Calendar, History, ClipboardList, Filter, ChevronUp,
   BarChart3, CheckCircle2, XCircle, AlertCircle, Info, Trash2, Edit3, ExternalLink
@@ -17,6 +18,7 @@ import { Circle as LeafletCircle, MapContainer, Marker, Popup, TileLayer } from 
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────
 type Role = "Salesperson" | "Manager" | "Executive";
+type Theme = "light" | "dark";
 type View =
   | "home" | "visits" | "visit-detail" | "record" | "report" | "email"
   | "reports" | "tasks" | "insights" | "map" | "team" | "settings"
@@ -440,6 +442,10 @@ export default function App() {
   const [modal, setModal] = useState<{ title: string; message: string; type?: "success" | "error" | "info"; action?: string } | null>(null);
   const [searchQ, setSearchQ] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
+  const [theme, setTheme] = useState<Theme>(() => {
+    const saved = localStorage.getItem("fv_theme");
+    return saved === "dark" ? "dark" : "light";
+  });
 
   // ── Data state
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
@@ -500,6 +506,12 @@ export default function App() {
       .catch(() => { localStorage.removeItem(TOKEN_KEY); setUser(null); })
       .finally(() => setBoot(false));
   }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("fv_theme", theme);
+  }, [theme]);
+
 
   // ─── Toast auto-dismiss ──────────────────────────────────────────────────
   useEffect(() => {
@@ -573,6 +585,22 @@ export default function App() {
     window.addEventListener("offline", onOffline);
     return () => { window.removeEventListener("online", onOnline); window.removeEventListener("offline", onOffline); };
   }, [user]);
+
+  // ─── Local data cleanup ─────────────────────────────────────────────────────
+  async function clearOfflineQueue() {
+    try {
+      const rows = await getOfflineRecordings();
+      for (const row of rows) {
+        await deleteOfflineRecording(row.id);
+      }
+      setOfflineCount(0);
+      notify(rows.length
+        ? `${rows.length} queued recording${rows.length > 1 ? "s" : ""} removed from this device.`
+        : "No queued recordings found.");
+    } catch (e: any) {
+      notify(e?.message || "Could not clear offline recordings.");
+    }
+  }
 
   // ─── Auth actions ────────────────────────────────────────────────────────
   function logout() {
@@ -1179,13 +1207,13 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
           {role === "Executive" && (
             <ExecutiveViews
               view={view} dashboard={dashboard} alerts={alerts}
-              leads={leads} customers={customers} onGo={go}
+              leads={leads} customers={customers} reports={reports} onGo={go}
             />
           )}
 
           {/* SHARED VIEWS (all roles) */}
           {view === "settings" && (
-            <SettingsView user={user} apiOK={apiOK} onLogout={logout} />
+            <SettingsView user={user} apiOK={apiOK} onLogout={logout} theme={theme} onThemeChange={setTheme} offlineCount={offlineCount} onClearOffline={clearOfflineQueue} />
           )}
           {view === "email" && report && (
             <EmailView report={report} onGo={go} user={user} />
@@ -1235,6 +1263,7 @@ function SalespersonViews(props: any) {
   if (view === "alerts") return <AlertsView {...props} />;
   if (view === "history") return <HistoryView {...props} />;
   if (view === "map") return <TerritoryView customers={props.customers} />;
+  if (view === "settings" || view === "email") return null;
   return <SalesHome {...props} />;
 }
 
@@ -1833,42 +1862,503 @@ function AISignalRow({ icon: Icon, label, value }: { icon: any; label: string; v
 }
 
 // ─── REPORTS LIST VIEW ────────────────────────────────────────────────────────
+// ─── REPORTS LIST VIEW ────────────────────────────────────────────────────────
 function ReportsListView({ reports }: any) {
   const [filter, setFilter] = useState("ALL");
   const [selected, setSelected] = useState<ApiReport | null>(null);
-  const filtered = reports.filter((r: ApiReport) => filter === "ALL" || r.status === filter);
+
+  const [voiceNote, setVoiceNote] = useState<ApiVoiceNote | null>(null);
+  const [voiceLoading, setVoiceLoading] = useState(false);
+  const [voiceError, setVoiceError] = useState("");
+
+  const filtered = reports.filter(
+    (r: ApiReport) => filter === "ALL" || r.status === filter
+  );
+
+  // Load the original field voice note whenever a report is opened.
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadVoiceNote() {
+      if (!selected?.voice_note_id) {
+        setVoiceNote(null);
+        setVoiceError("");
+        return;
+      }
+
+      setVoiceLoading(true);
+      setVoiceError("");
+      setVoiceNote(null);
+
+      try {
+        const response = await apiGet<{
+          status: string;
+          voice_note: ApiVoiceNote;
+        }>(`/voice-notes/${selected.voice_note_id}`);
+
+        if (!cancelled) {
+          setVoiceNote(response.voice_note);
+        }
+      } catch (error: any) {
+        if (!cancelled) {
+          setVoiceNote(null);
+          setVoiceError(
+            error?.message || "Unable to load the original voice note."
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setVoiceLoading(false);
+        }
+      }
+    }
+
+    loadVoiceNote();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selected]);
+
+  function closeReport() {
+    setSelected(null);
+    setVoiceNote(null);
+    setVoiceError("");
+  }
+
+  function getAudioUrl(fileUrl: string) {
+    if (!fileUrl) return "";
+
+    // If backend already returns a complete URL, use it directly.
+    if (/^https?:\/\//i.test(fileUrl)) {
+      return fileUrl;
+    }
+
+    // Otherwise prepend the backend URL.
+    return `${API_BASE_URL}${fileUrl.startsWith("/") ? "" : "/"}${fileUrl}`;
+  }
 
   return (
     <>
-      <SectionHeader eyebrow="REPORTS" title="Field reports" sub="All AI-generated field visit reports. Review content and track submission status." />
+      <SectionHeader
+        eyebrow="REPORTS"
+        title="Field reports"
+        sub="All AI-generated field visit reports. Review content, original field voice, and submission status."
+      />
+
+      {/* Report overview — derived entirely from the reports already loaded from the backend. */}
+      <div className="report-overview-grid">
+        {[
+          {
+            label: "Total reports",
+            value: reports.length,
+            icon: FileText,
+            tone: "blue",
+          },
+          {
+            label: "Submitted",
+            value: reports.filter((r: ApiReport) => r.status === "SUBMITTED").length,
+            icon: Send,
+            tone: "green",
+          },
+          {
+            label: "Approved",
+            value: reports.filter((r: ApiReport) => r.status === "APPROVED").length,
+            icon: CircleCheck,
+            tone: "navy",
+          },
+          {
+            label: "Drafts",
+            value: reports.filter((r: ApiReport) => r.status === "DRAFT").length,
+            icon: Edit3,
+            tone: "amber",
+          },
+        ].map(item => {
+          const Icon = item.icon;
+          return (
+            <div className={`report-overview-card ${item.tone}`} key={item.label}>
+              <div className="report-overview-icon">
+                <Icon size={17} />
+              </div>
+              <div className="report-overview-copy">
+                <span>{item.label}</span>
+                <strong>{item.value}</strong>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
       <div className="filter-row">
         {["ALL", "DRAFT", "EDITED", "SUBMITTED", "APPROVED"].map(f => (
-          <button key={f} className={`pill ${filter === f ? "active-pill" : ""}`} onClick={() => setFilter(f)}>{f === "ALL" ? "All" : f}</button>
+          <button
+            key={f}
+            className={`pill ${filter === f ? "active-pill" : ""}`}
+            onClick={() => setFilter(f)}
+          >
+            {f === "ALL" ? "All" : f}
+          </button>
         ))}
       </div>
+
       <div className="panel" style={{ marginTop: 14 }}>
-        {filtered.length === 0 ? <Empty text="No reports found. Complete a visit and submit a report to see it here." icon={FileText} /> : (
+        {filtered.length === 0 ? (
+          <Empty
+            text="No reports found. Complete a visit and submit a report to see it here."
+            icon={FileText}
+          />
+        ) : (
           <div className="table-list">
-            <div className="table-header"><span>Customer</span><span>Created by</span><span>Status</span><span>Date</span><span /></div>
+            <div className="table-header">
+              <span>Customer</span>
+              <span>Created by</span>
+              <span>Status</span>
+              <span>Date</span>
+              <span />
+            </div>
+
             {filtered.map((r: ApiReport) => (
-              <button className="table-row report-click-row" key={r.id} onClick={() => setSelected(r)} type="button">
-                <div><strong>{r.customer_name || "Unknown"}</strong><span style={{ fontSize: 9, color: "#6d5963" }}>{r.title}</span></div>
-                <span style={{ fontSize: 10 }}>{r.created_by_name}</span>
-                <Badge label={r.status} type={r.status === "SUBMITTED" || r.status === "APPROVED" ? "success" : "pending"} />
-                <span style={{ fontSize: 9 }}>{fmtDate(r.created_at)}</span>
-                <Eye size={13} style={{ color: "#a85b78" }} />
+              <button
+                className="table-row report-click-row"
+                key={r.id}
+                onClick={() => setSelected(r)}
+                type="button"
+              >
+                <div>
+                  <strong>{r.customer_name || "Unknown"}</strong>
+                  <span
+                    style={{
+                      fontSize: 9,
+                      color: "#6d5963",
+                    }}
+                  >
+                    {r.title}
+                  </span>
+                </div>
+
+                <span style={{ fontSize: 10 }}>
+                  {r.created_by_name}
+                </span>
+
+                <Badge
+                  label={r.status}
+                  type={
+                    r.status === "SUBMITTED" || r.status === "APPROVED"
+                      ? "success"
+                      : "pending"
+                  }
+                />
+
+                <span style={{ fontSize: 9 }}>
+                  {fmtDate(r.created_at)}
+                </span>
+
+                <Eye
+                  size={13}
+                  style={{ color: "#a85b78" }}
+                />
               </button>
             ))}
           </div>
         )}
       </div>
+
       {selected && (
-        <div className="modal-backdrop" onClick={e => { if (e.target === e.currentTarget) setSelected(null); }}>
+        <div
+          className="modal-backdrop"
+          onClick={e => {
+            if (e.target === e.currentTarget) {
+              closeReport();
+            }
+          }}
+        >
           <div className="report-detail-modal">
-            <div className="modal-head"><div><span className="eyebrow">REPORT DETAIL</span><h2>{selected.customer_name || "Report"}</h2></div><button className="icon-btn" onClick={() => setSelected(null)}><X size={15} /></button></div>
-            <div className="modal-meta"><Badge label={selected.status} type={selected.status === "SUBMITTED" || selected.status === "APPROVED" ? "success" : "pending"} /><span>{fmtDateTime(selected.created_at)}</span><span>By {selected.created_by_name}</span></div>
-            <div className="report-detail-body"><h3>Report</h3><pre>{selected.final_report || selected.edited_report || selected.ai_draft || "No report content available."}</pre></div>
-            <div className="modal-actions"><button className="button primary" onClick={() => setSelected(null)}>Close</button></div>
+
+            {/* HEADER */}
+            <div className="modal-head">
+              <div>
+                <span className="eyebrow">
+                  REPORT DETAIL
+                </span>
+
+                <h2>
+                  {selected.customer_name || "Report"}
+                </h2>
+              </div>
+
+              <button
+                className="icon-btn"
+                onClick={closeReport}
+              >
+                <X size={15} />
+              </button>
+            </div>
+
+            {/* META */}
+            <div className="modal-meta">
+              <Badge
+                label={selected.status}
+                type={
+                  selected.status === "SUBMITTED" ||
+                  selected.status === "APPROVED"
+                    ? "success"
+                    : "pending"
+                }
+              />
+
+              <span>
+                {fmtDateTime(selected.created_at)}
+              </span>
+
+              <span>
+                By {selected.created_by_name}
+              </span>
+            </div>
+
+            {/* ORIGINAL FIELD VOICE */}
+            <div
+              className="panel"
+              style={{
+                marginTop: 14,
+                padding: 14,
+                background: "#110d12",
+                border: "1px solid #30232b",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  marginBottom: 10,
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                  }}
+                >
+                  <div
+                    style={{
+                      width: 30,
+                      height: 30,
+                      borderRadius: 8,
+                      background: "rgba(184,59,104,.12)",
+                      border: "1px solid rgba(184,59,104,.25)",
+                      display: "grid",
+                      placeItems: "center",
+                    }}
+                  >
+                    <Headphones
+                      size={14}
+                      style={{ color: "#c35b7e" }}
+                    />
+                  </div>
+
+                  <div>
+                    <div
+                      style={{
+                        fontSize: 11,
+                        fontWeight: 700,
+                        color: "#eee7eb",
+                      }}
+                    >
+                      Original Field Voice
+                    </div>
+
+                    <div
+                      style={{
+                        fontSize: 8,
+                        color: "#6d5963",
+                        marginTop: 2,
+                      }}
+                    >
+                      Recorded by {selected.created_by_name}
+                    </div>
+                  </div>
+                </div>
+
+                {voiceNote?.duration_seconds != null && (
+                  <span
+                    className="pill"
+                    style={{ fontSize: 8 }}
+                  >
+                    {timeFmt(
+                      Math.round(voiceNote.duration_seconds)
+                    )}
+                  </span>
+                )}
+              </div>
+
+              {/* LOADING */}
+              {voiceLoading && (
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "12px 0",
+                    color: "#8d808a",
+                    fontSize: 10,
+                  }}
+                >
+                  <Spinner size={14} />
+                  Loading original field recording…
+                </div>
+              )}
+
+              {/* ERROR */}
+              {!voiceLoading && voiceError && (
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    gap: 8,
+                    padding: 10,
+                    borderRadius: 8,
+                    background: "rgba(221,90,116,.08)",
+                    border: "1px solid rgba(221,90,116,.2)",
+                    color: "#dd5a74",
+                    fontSize: 9,
+                    lineHeight: 1.5,
+                  }}
+                >
+                  <AlertTriangle size={13} />
+
+                  <div>
+                    <strong>
+                      Voice recording could not be loaded.
+                    </strong>
+
+                    <div style={{ marginTop: 3 }}>
+                      {voiceError}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* AUDIO PLAYER */}
+              {!voiceLoading &&
+                !voiceError &&
+                voiceNote?.file_url && (
+                  <div>
+                    <audio
+                      controls
+                      preload="metadata"
+                      src={getAudioUrl(voiceNote.file_url)}
+                      style={{
+                        width: "100%",
+                        height: 42,
+                        marginTop: 4,
+                      }}
+                    >
+                      Your browser does not support audio playback.
+                    </audio>
+
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                        marginTop: 7,
+                        fontSize: 8,
+                        color: "#6d5963",
+                      }}
+                    >
+                      <FileAudio size={11} />
+
+                      <span>
+                        {voiceNote.file_name || "Field voice recording"}
+                      </span>
+
+                      <span>•</span>
+
+                      <span>
+                        {voiceNote.processing_status || "RECORDED"}
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+              {/* NO VOICE NOTE */}
+              {!voiceLoading &&
+                !voiceError &&
+                !voiceNote &&
+                !selected.voice_note_id && (
+                  <div
+                    style={{
+                      padding: 10,
+                      borderRadius: 8,
+                      background: "#0f0c10",
+                      color: "#6d5963",
+                      fontSize: 9,
+                    }}
+                  >
+                    No original voice recording is linked to this report.
+                  </div>
+                )}
+
+              {/* TRANSCRIPTION */}
+              {!voiceLoading &&
+                voiceNote?.transcription && (
+                  <div
+                    style={{
+                      marginTop: 12,
+                      padding: 10,
+                      borderRadius: 8,
+                      background: "#0f0c10",
+                      border: "1px solid #241b21",
+                    }}
+                  >
+                    <div
+                      style={{
+                        fontSize: 8,
+                        color: "#6d5963",
+                        letterSpacing: "0.08em",
+                        marginBottom: 6,
+                      }}
+                    >
+                      ORIGINAL TRANSCRIPTION
+                    </div>
+
+                    <p
+                      style={{
+                        margin: 0,
+                        fontSize: 9,
+                        color: "#b9adb5",
+                        lineHeight: 1.65,
+                      }}
+                    >
+                      {voiceNote.transcription}
+                    </p>
+                  </div>
+                )}
+            </div>
+
+            {/* REPORT */}
+            <div className="report-detail-body">
+              <h3>AI Field Report</h3>
+
+              <pre>
+                {selected.final_report ||
+                  selected.edited_report ||
+                  selected.ai_draft ||
+                  "No report content available."}
+              </pre>
+            </div>
+
+            {/* ACTIONS */}
+            <div className="modal-actions">
+              <button
+                className="button primary"
+                onClick={closeReport}
+              >
+                Close
+              </button>
+            </div>
+
           </div>
         </div>
       )}
@@ -2415,9 +2905,9 @@ function InsightsView({ dashboard, alerts }: any) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // EXECUTIVE VIEWS
 // ═══════════════════════════════════════════════════════════════════════════════
-function ExecutiveViews({ view, dashboard, alerts, leads, customers, onGo }: any) {
+function ExecutiveViews({ view, dashboard, alerts, leads, customers, reports, onGo }: any) {
   if (view === "home") return <ExecutiveHome dashboard={dashboard} leads={leads} onGo={onGo} />;
-  if (view === "reports") return <ReportsListView reports={[]} onGo={onGo} />;
+  if (view === "reports") return <ReportsListView reports={reports} onGo={onGo} />;
   if (view === "leads") return <LeadsView leads={leads} customers={customers} onGo={onGo} />;
   if (view === "insights") return <InsightsView dashboard={dashboard} alerts={alerts} />;
   if (view === "map") return <TerritoryView customers={customers} />;
@@ -2563,82 +3053,207 @@ function TeamCard({ name, role, desc, status }: { name: string; role: string; de
 }
 
 // ─── SETTINGS VIEW ────────────────────────────────────────────────────────────
-function SettingsView({ user, apiOK, onLogout }: { user: AuthUser; apiOK: boolean; onLogout: () => void }) {
+function SettingsView({
+  user,
+  apiOK,
+  onLogout,
+  theme,
+  onThemeChange,
+  offlineCount,
+  onClearOffline,
+}: {
+  user: AuthUser;
+  apiOK: boolean;
+  onLogout: () => void;
+  theme: Theme;
+  onThemeChange: (theme: Theme) => void;
+  offlineCount: number;
+  onClearOffline: () => Promise<void>;
+}) {
+  type SettingsTab = "appearance" | "account" | "privacy" | "notifications" | "security" | "about";
+  const [tab, setTab] = useState<SettingsTab>("appearance");
   const [notifField, setNotifField] = useState(() => localStorage.getItem("fv_notif_field") !== "false");
   const [notifAlert, setNotifAlert] = useState(() => localStorage.getItem("fv_notif_alert") !== "false");
   const [notifReport, setNotifReport] = useState(() => localStorage.getItem("fv_notif_report") !== "false");
 
   function toggleNotif(key: string, val: boolean, setter: (v: boolean) => void) {
-    setter(val); localStorage.setItem(key, String(val));
+    setter(val);
+    localStorage.setItem(key, String(val));
   }
+
+  async function copyText(value: string, label: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      alert(`${label} copied.`);
+    } catch {
+      alert(`Unable to copy ${label.toLowerCase()}.`);
+    }
+  }
+
+  const tabs: { id: SettingsTab; label: string; icon: any; desc: string }[] = [
+    { id: "appearance", label: "Appearance", icon: Palette, desc: "Theme and visual preferences" },
+    { id: "account", label: "Account", icon: CircleUserRound, desc: "Profile and workspace identity" },
+    { id: "privacy", label: "Privacy & Data", icon: ShieldCheck, desc: "Local data and privacy controls" },
+    { id: "notifications", label: "Notifications", icon: Bell, desc: "Choose which updates you receive" },
+    { id: "security", label: "Security", icon: ShieldCheck, desc: "Session and access status" },
+    { id: "about", label: "About", icon: Info, desc: "Product and application details" },
+  ];
 
   return (
     <>
-      <SectionHeader eyebrow="SETTINGS" title="Account & security" sub="Your workspace is controlled by the authenticated backend account." />
-      <div className="settings-grid">
-        <div className="panel settings-profile-card">
-          <div className="settings-section-head">
-            <div><CircleUserRound size={20} style={{ color: "#9c5a76" }} /><h3>Profile</h3></div>
-          </div>
-          <div className="settings-profile-main">
-            <div className="avatar settings-avatar">{initials(user.full_name)}</div>
-            <div><h2>{user.full_name}</h2><p>{user.email}</p></div>
-            <span className="pill">{uiRole(user.role) || user.role}</span>
-          </div>
-          <div style={{ marginTop: 16 }}>
-            <div className="settings-kv"><span>Organization</span><strong>{user.organization_name || "FieldVoice Demo Corp"}</strong></div>
-            <div className="settings-kv"><span>Organization ID</span><code className="mono">{user.organization_id}</code></div>
-            <div className="settings-kv"><span>User ID</span><code className="mono">{user.id}</code></div>
-            <div className="settings-kv"><span>Role</span><strong>{user.role}</strong></div>
-            <div className="settings-kv"><span>Email</span><strong>{user.email}</strong></div>
-          </div>
-        </div>
+      <SectionHeader
+        eyebrow="SETTINGS"
+        title="Account & preferences"
+        sub="Manage your FieldVoice appearance, account details, privacy controls, notifications, and session information."
+      />
 
-        <div className="panel">
-          <div className="settings-section-head">
-            <div><ShieldCheck size={20} style={{ color: "#9c5a76" }} /><h3>Security status</h3></div>
+      <div className="settings-shell">
+        <aside className="panel settings-tabs-card">
+          <div className="settings-tabs-title">
+            <Settings size={16} />
+            <span>Settings</span>
           </div>
-          <div className="settings-row"><div><strong>Authentication</strong><span>JWT session (localStorage)</span></div><StatusChip label="Active" ok /></div>
-          <div className="settings-row"><div><strong>Role authorization</strong><span>{uiRole(user.role) || user.role}</span></div><StatusChip label="Backend enforced" ok /></div>
-          <div className="settings-row"><div><strong>Organization isolation</strong><span>Tenant-level data isolation</span></div><StatusChip label="Enforced" ok /></div>
-          <div className="settings-row"><div><strong>API connection</strong><span>{apiOK ? `Connected to ${API_BASE_URL}` : "Disconnected"}</span></div><StatusChip label={apiOK ? "Connected" : "Offline"} ok={apiOK} /></div>
-          <div className="privacy-note" style={{ marginTop: 12 }}>
-            <ShieldCheck size={16} />
-            <span>There is no frontend role switch. Your permissions come exclusively from the signed-in backend account.</span>
-          </div>
-        </div>
 
-        <div className="panel">
-          <div className="settings-section-head">
-            <div><Bell size={20} style={{ color: "#9c5a76" }} /><h3>Notification preferences</h3></div>
+          <div className="settings-tabs">
+            {tabs.map(item => {
+              const Icon = item.icon;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={`settings-tab ${tab === item.id ? "active" : ""}`}
+                  onClick={() => setTab(item.id)}
+                >
+                  <Icon size={15} />
+                  <span>
+                    <strong>{item.label}</strong>
+                    <small>{item.desc}</small>
+                  </span>
+                  <ChevronRight size={13} />
+                </button>
+              );
+            })}
           </div>
-          <div className="settings-row settings-toggle-row">
-            <div><strong>Field sync alerts</strong><span>Notify when offline recordings sync</span></div>
-            <button className={`toggle ${notifField ? "on" : ""}`} onClick={() => toggleNotif("fv_notif_field", !notifField, setNotifField)}><span /></button>
-          </div>
-          <div className="settings-row settings-toggle-row">
-            <div><strong>AI alert notifications</strong><span>Notify on high-severity alerts</span></div>
-            <button className={`toggle ${notifAlert ? "on" : ""}`} onClick={() => toggleNotif("fv_notif_alert", !notifAlert, setNotifAlert)}><span /></button>
-          </div>
-          <div className="settings-row settings-toggle-row">
-            <div><strong>Report submission alerts</strong><span>Notify when reports are submitted</span></div>
-            <button className={`toggle ${notifReport ? "on" : ""}`} onClick={() => toggleNotif("fv_notif_report", !notifReport, setNotifReport)}><span /></button>
-          </div>
-        </div>
+        </aside>
 
-        <div className="panel settings-trust-card">
-          <div className="settings-section-head">
-            <div><Info size={20} style={{ color: "#9c5a76" }} /><h3>About FieldVoice AI</h3></div>
-          </div>
-          <p>FieldVoice AI v0.1 · Built on FastAPI + PostgreSQL + Gemini AI · React + Vite frontend</p>
-          <div className="privacy-note">
-            <ShieldCheck size={16} />
-            <span>All data is org-isolated. JWT tokens are stored in localStorage. No data is shared across organizations.</span>
-          </div>
-          <button className="button danger full" style={{ marginTop: 16 }} onClick={onLogout}>
-            <LogOut size={15} /> Sign out of FieldVoice
-          </button>
-        </div>
+        <section className="settings-content">
+          {tab === "appearance" && (
+            <div className="panel settings-panel">
+              <div className="settings-section-head">
+                <div><Palette size={20} /><h3>Appearance</h3></div>
+                <span className="pill">Saved on this device</span>
+              </div>
+              <p className="settings-intro">
+                Choose the visual theme for the FieldVoice workspace. Your choice is stored locally and does not affect backend data.
+              </p>
+              <div className="appearance-grid">
+                <button type="button" className={`appearance-option ${theme === "light" ? "active" : ""}`} onClick={() => onThemeChange("light")}>
+                  <div className="appearance-preview light-preview"><div /><div /><div /></div>
+                  <div className="appearance-option-copy">
+                    <div><Sun size={15} /><strong>Light</strong></div>
+                    <span>Professional blue, white and dark-blue workspace</span>
+                  </div>
+                  {theme === "light" && <CheckCircle2 size={18} className="appearance-check" />}
+                </button>
+                <button type="button" className={`appearance-option ${theme === "dark" ? "active" : ""}`} onClick={() => onThemeChange("dark")}>
+                  <div className="appearance-preview dark-preview"><div /><div /><div /></div>
+                  <div className="appearance-option-copy">
+                    <div><Moon size={15} /><strong>Dark</strong></div>
+                    <span>Original wine-red FieldVoice dark interface</span>
+                  </div>
+                  {theme === "dark" && <CheckCircle2 size={18} className="appearance-check" />}
+                </button>
+              </div>
+              <div className="settings-callout">
+                <Palette size={15} />
+                <div><strong>Theme affects the UI only</strong><span>Reports, customers, recordings, AI processing, and backend permissions remain unchanged.</span></div>
+              </div>
+            </div>
+          )}
+
+          {tab === "account" && (
+            <div className="panel settings-panel">
+              <div className="settings-section-head">
+                <div><CircleUserRound size={20} /><h3>Account</h3></div>
+                <span className="status-chip success"><i /> Active account</span>
+              </div>
+              <div className="settings-profile-main">
+                <div className="avatar settings-avatar">{initials(user.full_name)}</div>
+                <div><h2>{user.full_name}</h2><p>{user.email}</p></div>
+                <span className="pill">{uiRole(user.role) || user.role}</span>
+              </div>
+              <div className="settings-detail-grid">
+                <div className="settings-detail-card"><span>Full name</span><strong>{user.full_name}</strong></div>
+                <div className="settings-detail-card"><span>Email</span><strong>{user.email}</strong><button className="settings-inline-action" type="button" onClick={() => copyText(user.email, "Email")}>Copy</button></div>
+                <div className="settings-detail-card"><span>Role</span><strong>{uiRole(user.role) || user.role}</strong></div>
+                <div className="settings-detail-card"><span>Organization</span><strong>{user.organization_name || "FieldVoice Demo Corp"}</strong></div>
+                <div className="settings-detail-card"><span>Organization ID</span><code>{user.organization_id}</code><button className="settings-inline-action" type="button" onClick={() => copyText(user.organization_id, "Organization ID")}>Copy</button></div>
+                <div className="settings-detail-card"><span>User ID</span><code>{user.id}</code><button className="settings-inline-action" type="button" onClick={() => copyText(user.id, "User ID")}>Copy</button></div>
+              </div>
+              <div className="settings-divider" />
+              <div className="settings-action-row">
+                <div><strong>Sign out</strong><span>End the current FieldVoice session on this browser.</span></div>
+                <button className="button danger" type="button" onClick={onLogout}><LogOut size={14} /> Sign out</button>
+              </div>
+            </div>
+          )}
+
+          {tab === "privacy" && (
+            <div className="panel settings-panel">
+              <div className="settings-section-head"><div><ShieldCheck size={20} /><h3>Privacy & Data</h3></div></div>
+              <div className="settings-row"><div><strong>Organization isolation</strong><span>Backend tenant isolation is enforced by the authenticated account.</span></div><StatusChip label="Enforced" ok /></div>
+              <div className="settings-row"><div><strong>Browser session</strong><span>Authentication token is kept in local browser storage for this prototype.</span></div><StatusChip label="Local" /></div>
+              <div className="settings-row">
+                <div><strong>Offline recordings</strong><span>{offlineCount} recording{offlineCount === 1 ? "" : "s"} currently queued on this device.</span></div>
+                <div className="settings-row-actions">
+                  <span className="pill"><Database size={12} /> {offlineCount} queued</span>
+                  <button className="button ghost" type="button" disabled={!offlineCount} onClick={onClearOffline}><Trash2 size={13} /> Clear local queue</button>
+                </div>
+              </div>
+              <div className="privacy-note settings-privacy-card">
+                <ShieldCheck size={16} />
+                <div><strong>Privacy note</strong><span>FieldVoice keeps organization data separated through backend authorization. Clearing the local queue only removes recordings waiting on this browser and does not delete submitted backend records.</span></div>
+              </div>
+            </div>
+          )}
+
+          {tab === "notifications" && (
+            <div className="panel settings-panel">
+              <div className="settings-section-head"><div><Bell size={20} /><h3>Notification preferences</h3></div><span className="pill">Browser preferences</span></div>
+              <div className="settings-row settings-toggle-row"><div><strong>Field sync alerts</strong><span>Show a notification when offline recordings are synchronized.</span></div><button className={`toggle ${notifField ? "on" : ""}`} onClick={() => toggleNotif("fv_notif_field", !notifField, setNotifField)}><span /></button></div>
+              <div className="settings-row settings-toggle-row"><div><strong>AI alert notifications</strong><span>Show high-severity AI alerts in the workspace.</span></div><button className={`toggle ${notifAlert ? "on" : ""}`} onClick={() => toggleNotif("fv_notif_alert", !notifAlert, setNotifAlert)}><span /></button></div>
+              <div className="settings-row settings-toggle-row"><div><strong>Report submission alerts</strong><span>Show a confirmation when a report is submitted.</span></div><button className={`toggle ${notifReport ? "on" : ""}`} onClick={() => toggleNotif("fv_notif_report", !notifReport, setNotifReport)}><span /></button></div>
+              <div className="settings-callout" style={{ marginTop: 16 }}><Bell size={15} /><div><strong>These preferences are local</strong><span>They change workspace notification behavior in this browser only; they do not alter backend records.</span></div></div>
+            </div>
+          )}
+
+          {tab === "security" && (
+            <div className="panel settings-panel">
+              <div className="settings-section-head"><div><ShieldCheck size={20} /><h3>Security</h3></div><StatusChip label={apiOK ? "Connected" : "Offline"} ok={apiOK} /></div>
+              <div className="settings-security-grid">
+                <div className="settings-security-card"><ShieldCheck size={18} /><strong>Authentication</strong><span>JWT-based authenticated session</span><b>Active</b></div>
+                <div className="settings-security-card"><Users size={18} /><strong>Role authorization</strong><span>{uiRole(user.role) || user.role}</span><b>Backend enforced</b></div>
+                <div className="settings-security-card"><Globe size={18} /><strong>API connection</strong><span>{apiOK ? API_BASE_URL : "API unavailable"}</span><b>{apiOK ? "Reachable" : "Disconnected"}</b></div>
+                <div className="settings-security-card"><Calendar size={18} /><strong>Session storage</strong><span>Browser local storage</span><b>Prototype</b></div>
+              </div>
+              <div className="privacy-note settings-privacy-card"><ShieldCheck size={16} /><div><strong>Role control</strong><span>Your FieldVoice permissions come from the signed-in backend account. There is no frontend role switch.</span></div></div>
+            </div>
+          )}
+
+          {tab === "about" && (
+            <div className="panel settings-panel">
+              <div className="settings-section-head"><div><Info size={20} /><h3>About FieldVoice AI</h3></div><span className="pill">v0.1 Prototype</span></div>
+              <div className="about-hero"><div className="brand-mark"><Mic size={17} /></div><div><strong>FieldVoice AI</strong><span>Voice-first field sales intelligence</span></div></div>
+              <div className="settings-detail-grid">
+                <div className="settings-detail-card"><span>Frontend</span><strong>React + Vite</strong></div>
+                <div className="settings-detail-card"><span>Backend</span><strong>FastAPI</strong></div>
+                <div className="settings-detail-card"><span>Database</span><strong>PostgreSQL / Supabase</strong></div>
+                <div className="settings-detail-card"><span>AI</span><strong>Gemini</strong></div>
+              </div>
+              <div className="privacy-note settings-privacy-card"><Info size={16} /><div><strong>Prototype status</strong><span>UI preferences are handled in the frontend. Business data, authentication, AI processing, and report permissions continue to use the existing backend.</span></div></div>
+            </div>
+          )}
+        </section>
       </div>
     </>
   );
