@@ -14,8 +14,25 @@ router = APIRouter(
 )
 
 
+# =========================================================
+# REQUEST MODELS
+# =========================================================
+
 class ReportEditRequest(BaseModel):
     edited_report: str
+
+
+class ReportRejectRequest(BaseModel):
+    rejection_reason: str
+
+
+# =========================================================
+# SHARED HELPERS
+# =========================================================
+
+def normalized_role(current_user: dict) -> str:
+    """Return the authenticated role in a predictable uppercase form."""
+    return str(current_user.get("role") or "").strip().upper()
 
 
 def get_report_access(
@@ -23,9 +40,22 @@ def get_report_access(
     db: Session,
     current_user: dict,
 ):
+    """
+    Fetch one report only when it belongs to the authenticated user's
+    organization.
+
+    FIELD_REP / SALESPERSON:
+        Can only access reports they created.
+
+    MANAGER / EXECUTIVE:
+        Can access reports across their organization.
+
+    Approval/rejection actor names are returned through LEFT JOINs so
+    old reports with NULL approval/rejection metadata remain readable.
+    """
     organization_id = current_user["organization_id"]
     user_id = current_user["id"]
-    role = current_user["role"]
+    role = normalized_role(current_user)
 
     query = """
         SELECT
@@ -42,6 +72,11 @@ def get_report_access(
             r.submitted_at,
             r.approved_at,
             r.approved_by,
+            approved_user.full_name AS approved_by_name,
+            r.rejected_at,
+            r.rejected_by,
+            rejected_user.full_name AS rejected_by_name,
+            r.rejection_reason,
             r.created_at,
             r.updated_at,
             c.name AS customer_name,
@@ -53,6 +88,10 @@ def get_report_access(
             ON c.id = v.customer_id
         JOIN users u
             ON u.id = r.created_by
+        LEFT JOIN users approved_user
+            ON approved_user.id = r.approved_by
+        LEFT JOIN users rejected_user
+            ON rejected_user.id = r.rejected_by
         WHERE r.id = :report_id
           AND r.organization_id = :organization_id
     """
@@ -62,7 +101,7 @@ def get_report_access(
         "organization_id": organization_id,
     }
 
-    if role == "FIELD_REP":
+    if role in {"FIELD_REP", "SALESPERSON"}:
         query += """
             AND r.created_by = :user_id
         """
@@ -80,6 +119,28 @@ def get_report_access(
     return result.mappings().first()
 
 
+def require_manager(current_user: dict) -> None:
+    """Approval workflow is intentionally Manager-only."""
+    role = normalized_role(current_user)
+
+    if role != "MANAGER":
+        raise HTTPException(
+            status_code=403,
+            detail="Only MANAGER users can approve or reject reports.",
+        )
+
+
+def require_field_rep(current_user: dict) -> None:
+    """Editing/resubmission is intentionally Field-Rep-only."""
+    role = normalized_role(current_user)
+
+    if role not in {"FIELD_REP", "SALESPERSON"}:
+        raise HTTPException(
+            status_code=403,
+            detail="Only FIELD_REP users can edit or resubmit reports.",
+        )
+
+
 # =========================================================
 # CREATE AI DRAFT REPORT
 # =========================================================
@@ -93,9 +154,9 @@ def create_report_draft(
 ):
     organization_id = current_user["organization_id"]
     user_id = current_user["id"]
-    role = current_user["role"]
+    role = normalized_role(current_user)
 
-    # Verify visit
+    # Verify visit.
     visit = db.execute(
         text("""
             SELECT
@@ -122,9 +183,9 @@ def create_report_draft(
             detail="Visit not found in your organization.",
         )
 
-    # FIELD_REP can create reports only for their own visits
+    # FIELD_REP / SALESPERSON can create reports only for their own visits.
     if (
-        role == "FIELD_REP"
+        role in {"FIELD_REP", "SALESPERSON"}
         and str(visit["user_id"]) != str(user_id)
     ):
         raise HTTPException(
@@ -132,7 +193,7 @@ def create_report_draft(
             detail="You can only create reports for your own visits.",
         )
 
-    # Find voice note
+    # Find requested voice note, or the latest transcribed note for the visit.
     if voice_note_id:
         voice_note = db.execute(
             text("""
@@ -176,7 +237,7 @@ def create_report_draft(
             detail="No transcribed voice note found for this visit.",
         )
 
-    # Find latest AI insight
+    # Find latest AI insight.
     insight = db.execute(
         text("""
             SELECT
@@ -204,7 +265,7 @@ def create_report_draft(
             detail="No AI insight found for this visit.",
         )
 
-    # Get action items
+    # Get action items.
     action_result = db.execute(
         text("""
             SELECT
@@ -224,7 +285,7 @@ def create_report_draft(
 
     action_items = action_result.mappings().all()
 
-    # Build report draft
+    # Build report draft.
     key_insights = insight["key_insights"] or []
 
     draft_lines = [
@@ -268,7 +329,7 @@ def create_report_draft(
 
     ai_draft = "\n".join(draft_lines)
 
-    # Insert report
+    # Insert report.
     result = db.execute(
         text("""
             INSERT INTO reports (
@@ -319,10 +380,17 @@ def create_report_draft(
 
     db.commit()
 
+    # Return a complete API shape where possible.
+    created_report = get_report_access(
+        str(report["id"]),
+        db,
+        current_user,
+    )
+
     return {
         "status": "success",
         "message": "AI draft report created successfully.",
-        "report": dict(report),
+        "report": dict(created_report or report),
     }
 
 
@@ -338,7 +406,7 @@ def get_reports(
 ):
     organization_id = current_user["organization_id"]
     user_id = current_user["id"]
-    role = current_user["role"]
+    role = normalized_role(current_user)
 
     query = """
         SELECT
@@ -355,6 +423,11 @@ def get_reports(
             r.submitted_at,
             r.approved_at,
             r.approved_by,
+            approved_user.full_name AS approved_by_name,
+            r.rejected_at,
+            r.rejected_by,
+            rejected_user.full_name AS rejected_by_name,
+            r.rejection_reason,
             r.created_at,
             r.updated_at,
             c.name AS customer_name,
@@ -366,6 +439,10 @@ def get_reports(
             ON c.id = v.customer_id
         JOIN users u
             ON u.id = r.created_by
+        LEFT JOIN users approved_user
+            ON approved_user.id = r.approved_by
+        LEFT JOIN users rejected_user
+            ON rejected_user.id = r.rejected_by
         WHERE r.organization_id = :organization_id
     """
 
@@ -373,17 +450,36 @@ def get_reports(
         "organization_id": organization_id,
     }
 
-    if role == "FIELD_REP":
+    if role in {"FIELD_REP", "SALESPERSON"}:
         query += """
             AND r.created_by = :user_id
         """
         params["user_id"] = user_id
 
     if status:
+        normalized_status = status.strip().upper()
+
+        allowed_statuses = {
+            "DRAFT",
+            "EDITED",
+            "SUBMITTED",
+            "APPROVED",
+            "REJECTED",
+        }
+
+        if normalized_status not in allowed_statuses:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Invalid report status. Allowed values: "
+                    "DRAFT, EDITED, SUBMITTED, APPROVED, REJECTED."
+                ),
+            )
+
         query += """
             AND r.status = :status
         """
-        params["status"] = status
+        params["status"] = normalized_status
 
     query += """
         ORDER BY r.created_at DESC
@@ -445,6 +541,8 @@ def edit_report(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    require_field_rep(current_user)
+
     report = get_report_access(
         report_id,
         db,
@@ -457,19 +555,22 @@ def edit_report(
             detail="Report not found or access denied.",
         )
 
-    if report["status"] in {
-        "SUBMITTED",
-        "APPROVED",
-    }:
-        raise HTTPException(
-            status_code=400,
-            detail="This report can no longer be edited.",
-        )
-
     if not payload.edited_report.strip():
         raise HTTPException(
             status_code=400,
             detail="Edited report cannot be empty.",
+        )
+
+    current_status = str(report["status"] or "").upper()
+
+    # A Field Rep may edit only their own DRAFT / EDITED / REJECTED report.
+    if current_status not in {"DRAFT", "EDITED", "REJECTED"}:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Only DRAFT, EDITED, or REJECTED reports can be edited. "
+                "Submitted and approved reports are locked."
+            ),
         )
 
     db.execute(
@@ -478,14 +579,22 @@ def edit_report(
             SET
                 edited_report = :edited_report,
                 status = 'EDITED',
+                approved_by = NULL,
+                approved_at = NULL,
+                rejected_by = NULL,
+                rejected_at = NULL,
+                rejection_reason = NULL,
                 updated_at = now()
             WHERE id = :report_id
               AND organization_id = :organization_id
+              AND created_by = :created_by
+              AND status IN ('DRAFT', 'EDITED', 'REJECTED')
         """),
         {
-            "edited_report": payload.edited_report,
+            "edited_report": payload.edited_report.strip(),
             "report_id": report_id,
             "organization_id": current_user["organization_id"],
+            "created_by": current_user["id"],
         },
     )
 
@@ -496,6 +605,12 @@ def edit_report(
         db,
         current_user,
     )
+
+    if not updated_report:
+        raise HTTPException(
+            status_code=404,
+            detail="Report could not be retrieved after editing.",
+        )
 
     return {
         "status": "success",
@@ -514,6 +629,8 @@ def submit_report(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    require_field_rep(current_user)
+
     report = get_report_access(
         report_id,
         db,
@@ -526,7 +643,9 @@ def submit_report(
             detail="Report not found or access denied.",
         )
 
-    if report["status"] not in {
+    current_status = str(report["status"] or "").upper()
+
+    if current_status not in {
         "DRAFT",
         "EDITED",
     }:
@@ -536,28 +655,78 @@ def submit_report(
         )
 
     final_report = (
-        report["edited_report"]
+        str(report["edited_report"]).strip()
         if report["edited_report"]
-        else report["ai_draft"]
+        and str(report["edited_report"]).strip()
+        else str(report["ai_draft"] or "").strip()
     )
 
-    db.execute(
+    if not final_report:
+        raise HTTPException(
+            status_code=400,
+            detail="Report content is empty and cannot be submitted.",
+        )
+
+    report_visit_id = str(report["visit_id"])
+
+    update_result = db.execute(
         text("""
             UPDATE reports
             SET
                 final_report = :final_report,
                 status = 'SUBMITTED',
                 submitted_at = now(),
+                approved_by = NULL,
+                approved_at = NULL,
+                rejected_by = NULL,
+                rejected_at = NULL,
+                rejection_reason = NULL,
                 updated_at = now()
             WHERE id = :report_id
               AND organization_id = :organization_id
+              AND created_by = :created_by
+              AND status IN ('DRAFT', 'EDITED')
         """),
         {
             "final_report": final_report,
             "report_id": report_id,
             "organization_id": current_user["organization_id"],
+            "created_by": current_user["id"],
         },
     )
+
+    if update_result.rowcount != 1:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="The report changed before it could be submitted. Please refresh and try again.",
+        )
+
+    # A successful Field Rep report submission completes the associated visit
+    # in the same transaction as the report status change.
+    visit_update = db.execute(
+        text("""
+            UPDATE visits
+            SET
+                status = 'COMPLETED',
+                updated_at = now()
+            WHERE id = :visit_id
+              AND organization_id = :organization_id
+              AND user_id = :created_by
+        """),
+        {
+            "visit_id": report_visit_id,
+            "organization_id": current_user["organization_id"],
+            "created_by": current_user["id"],
+        },
+    )
+
+    if visit_update.rowcount != 1:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="The report could not complete its associated visit. Please refresh and retry.",
+        )
 
     db.commit()
 
@@ -566,6 +735,12 @@ def submit_report(
         db,
         current_user,
     )
+
+    if not updated_report:
+        raise HTTPException(
+            status_code=404,
+            detail="Report could not be retrieved after submission.",
+        )
 
     return {
         "status": "success",
@@ -584,16 +759,7 @@ def approve_report(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    role = current_user["role"]
-
-    if role not in {
-        "MANAGER",
-        "EXECUTIVE",
-    }:
-        raise HTTPException(
-            status_code=403,
-            detail="Only MANAGER or EXECUTIVE can approve reports.",
-        )
+    require_manager(current_user)
 
     report = get_report_access(
         report_id,
@@ -607,22 +773,34 @@ def approve_report(
             detail="Report not found or access denied.",
         )
 
-    if report["status"] != "SUBMITTED":
+    if str(report["status"] or "").upper() != "SUBMITTED":
         raise HTTPException(
             status_code=400,
             detail="Only SUBMITTED reports can be approved.",
         )
 
-    db.execute(
+    # Prevent a manager from approving their own report.
+    if str(report["created_by"]) == str(current_user["id"]):
+        raise HTTPException(
+            status_code=403,
+            detail="You cannot approve a report created by your own account.",
+        )
+
+    update_result = db.execute(
         text("""
             UPDATE reports
             SET
                 status = 'APPROVED',
                 approved_by = :approved_by,
                 approved_at = now(),
+                rejected_by = NULL,
+                rejected_at = NULL,
+                rejection_reason = NULL,
                 updated_at = now()
             WHERE id = :report_id
               AND organization_id = :organization_id
+              AND status = 'SUBMITTED'
+              AND created_by <> :approved_by
         """),
         {
             "approved_by": current_user["id"],
@@ -631,6 +809,13 @@ def approve_report(
         },
     )
 
+    if update_result.rowcount != 1:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="The report was already changed. Refresh the report and try again.",
+        )
+
     db.commit()
 
     updated_report = get_report_access(
@@ -638,6 +823,12 @@ def approve_report(
         db,
         current_user,
     )
+
+    if not updated_report:
+        raise HTTPException(
+            status_code=404,
+            detail="Report could not be retrieved after approval.",
+        )
 
     return {
         "status": "success",
@@ -653,18 +844,24 @@ def approve_report(
 @router.post("/{report_id}/reject")
 def reject_report(
     report_id: str,
+    payload: ReportRejectRequest,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    role = current_user["role"]
+    require_manager(current_user)
 
-    if role not in {
-        "MANAGER",
-        "EXECUTIVE",
-    }:
+    reason = payload.rejection_reason.strip()
+
+    if not reason:
         raise HTTPException(
-            status_code=403,
-            detail="Only MANAGER or EXECUTIVE can reject reports.",
+            status_code=400,
+            detail="Rejection reason is required.",
+        )
+
+    if len(reason) > 2000:
+        raise HTTPException(
+            status_code=400,
+            detail="Rejection reason cannot exceed 2000 characters.",
         )
 
     report = get_report_access(
@@ -679,26 +876,49 @@ def reject_report(
             detail="Report not found or access denied.",
         )
 
-    if report["status"] != "SUBMITTED":
+    if str(report["status"] or "").upper() != "SUBMITTED":
         raise HTTPException(
             status_code=400,
             detail="Only SUBMITTED reports can be rejected.",
         )
 
-    db.execute(
+    # Prevent a manager from rejecting their own report.
+    if str(report["created_by"]) == str(current_user["id"]):
+        raise HTTPException(
+            status_code=403,
+            detail="You cannot reject a report created by your own account.",
+        )
+
+    update_result = db.execute(
         text("""
             UPDATE reports
             SET
                 status = 'REJECTED',
+                rejected_by = :rejected_by,
+                rejected_at = now(),
+                rejection_reason = :rejection_reason,
+                approved_by = NULL,
+                approved_at = NULL,
                 updated_at = now()
             WHERE id = :report_id
               AND organization_id = :organization_id
+              AND status = 'SUBMITTED'
+              AND created_by <> :rejected_by
         """),
         {
+            "rejected_by": current_user["id"],
+            "rejection_reason": reason,
             "report_id": report_id,
             "organization_id": current_user["organization_id"],
         },
     )
+
+    if update_result.rowcount != 1:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="The report was already changed. Refresh the report and try again.",
+        )
 
     db.commit()
 
@@ -707,6 +927,12 @@ def reject_report(
         db,
         current_user,
     )
+
+    if not updated_report:
+        raise HTTPException(
+            status_code=404,
+            detail="Report could not be retrieved after rejection.",
+        )
 
     return {
         "status": "success",

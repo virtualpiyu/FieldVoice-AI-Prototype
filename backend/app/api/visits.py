@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 
 from app.database import get_db
 from app.core.dependencies import get_current_user, require_role
@@ -190,6 +191,179 @@ def get_visits(
         "status": "success",
         "count": len(visits),
         "visits": visits,
+    }
+
+
+class VisitUpdateRequest(BaseModel):
+    status: str | None = None
+    notes: str | None = None
+
+
+@router.patch("/{visit_id}")
+def update_visit(
+    visit_id: str,
+    payload: VisitUpdateRequest,
+    current_user: dict = Depends(
+        require_role("FIELD_REP", "MANAGER", "EXECUTIVE")
+    ),
+    db: Session = Depends(get_db),
+):
+    """
+    Update a visit within the authenticated user's organization.
+
+    FIELD_REP:
+        Own visits only.
+
+    MANAGER:
+        Own visits and visits belonging to directly assigned Field Reps.
+
+    EXECUTIVE:
+        Any visit in the organization.
+
+    The primary workflow is report submission -> visit completion.
+    """
+    organization_id = current_user["organization_id"]
+    user_id = str(current_user["id"])
+    role = str(current_user["role"] or "").strip().upper()
+
+    visit = db.execute(
+        text("""
+            SELECT
+                v.id,
+                v.organization_id,
+                v.user_id,
+                v.status,
+                v.notes
+            FROM visits v
+            WHERE v.id = :visit_id
+              AND v.organization_id = :organization_id
+            LIMIT 1
+        """),
+        {
+            "visit_id": visit_id,
+            "organization_id": organization_id,
+        },
+    ).mappings().first()
+
+    if not visit:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Visit not found.",
+        )
+
+    visit_user_id = str(visit["user_id"])
+
+    if role == "FIELD_REP":
+        allowed = visit_user_id == user_id
+    elif role == "MANAGER":
+        allowed = visit_user_id == user_id or db.execute(
+            text("""
+                SELECT 1
+                FROM users
+                WHERE id = :field_rep_id
+                  AND organization_id = :organization_id
+                  AND manager_id = :manager_id
+                  AND role = 'FIELD_REP'
+                LIMIT 1
+            """),
+            {
+                "field_rep_id": visit_user_id,
+                "organization_id": organization_id,
+                "manager_id": user_id,
+            },
+        ).first() is not None
+    else:
+        allowed = True
+
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to update this visit.",
+        )
+
+    next_status = (
+        str(payload.status).strip().upper()
+        if payload.status is not None
+        else str(visit["status"] or "").strip().upper()
+    )
+    allowed_statuses = {"IN_PROGRESS", "COMPLETED", "CANCELLED"}
+
+    if next_status not in allowed_statuses:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Invalid visit status. Allowed values: "
+                "IN_PROGRESS, COMPLETED, CANCELLED."
+            ),
+        )
+
+    next_notes = payload.notes if payload.notes is not None else visit["notes"]
+
+    result = db.execute(
+        text("""
+            UPDATE visits
+            SET
+                status = :status,
+                notes = :notes,
+                updated_at = now()
+            WHERE id = :visit_id
+              AND organization_id = :organization_id
+        """),
+        {
+            "status": next_status,
+            "notes": next_notes,
+            "visit_id": visit_id,
+            "organization_id": organization_id,
+        },
+    )
+
+    if result.rowcount != 1:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The visit changed before it could be updated.",
+        )
+
+    db.commit()
+
+    updated = db.execute(
+        text("""
+            SELECT
+                v.id,
+                v.organization_id,
+                v.customer_id,
+                c.name AS customer_name,
+                v.territory_id,
+                v.user_id,
+                u.full_name AS user_name,
+                v.visit_date,
+                v.latitude,
+                v.longitude,
+                v.location_accuracy_m,
+                v.visit_type,
+                v.status,
+                v.notes,
+                v.created_at,
+                v.updated_at
+            FROM visits v
+            JOIN customers c
+                ON c.id = v.customer_id
+            JOIN users u
+                ON u.id = v.user_id
+            WHERE v.id = :visit_id
+              AND v.organization_id = :organization_id
+            LIMIT 1
+        """),
+        {
+            "visit_id": visit_id,
+            "organization_id": organization_id,
+        },
+    ).mappings().first()
+
+    return {
+        "status": "success",
+        "message": "Visit updated successfully.",
+        "visit": dict(updated),
     }
 
 

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity, AlertTriangle, ArrowUpRight, Bell, Bot, BriefcaseBusiness, Check,
   CircleCheck, ChevronDown, Cloud, CloudOff, RefreshCw, Wifi, WifiOff, Mail,
@@ -21,7 +21,7 @@ type Role = "Salesperson" | "Manager" | "Executive";
 type Theme = "light" | "dark";
 type View =
   | "home" | "visits" | "visit-detail" | "record" | "report" | "email"
-  | "reports" | "tasks" | "insights" | "map" | "team" | "settings"
+  | "reports" | "tasks" | "insights" | "map" | "team" | "rep-activity" | "settings"
   | "customers" | "customer-detail" | "leads" | "history" | "alerts";
 
 type Report = {
@@ -57,10 +57,62 @@ type AuthUser = {
   organization_id: string; organization_name?: string | null;
 };
 
+type ApiTeamUser = {
+  id: string;
+  organization_id: string;
+  full_name: string;
+  email: string;
+  role: string;
+  phone?: string | null;
+  is_active?: boolean;
+  manager_id?: string | null;
+  manager_name?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+type ApiRepActivity = {
+  user: ApiTeamUser;
+  metrics: {
+    visits: number;
+    reports: number;
+    submitted_reports: number;
+    pending_action_items: number;
+    open_alerts: number;
+    high_opportunities: number;
+    high_risks: number;
+  };
+  latest_insight?: {
+    summary?: string | null;
+    sentiment?: string | null;
+    opportunity_level?: string | null;
+    risk_level?: string | null;
+    created_at?: string | null;
+  } | null;
+  recent_visits: Array<ApiVisit & {
+    sentiment?: string | null;
+    opportunity_level?: string | null;
+    risk_level?: string | null;
+  }>;
+  recent_reports: Array<{
+    id: string;
+    title: string;
+    customer_name: string | null;
+    status: string;
+    created_at: string | null;
+    submitted_at: string | null;
+  }>;
+  action_items: ApiActionItem[];
+  alerts: ApiAlert[];
+};
+
 type ApiActionItem = {
   id: string; title: string; description: string | null;
   priority: string; status: string; due_date: string | null;
   customer_name: string | null; visit_id?: string | null; source?: string;
+  assigned_to?: string | null;
+  assigned_user_name?: string | null;
+  created_at?: string | null;
 };
 
 type ApiAlert = {
@@ -98,11 +150,31 @@ type ApiVoiceNote = {
 };
 
 type ApiReport = {
-  id: string; visit_id: string; voice_note_id: string | null;
-  title: string; ai_draft: string | null; edited_report: string | null;
-  final_report: string | null; status: string;
-  customer_name: string; created_by_name: string;
-  submitted_at: string | null; created_at: string;
+  id: string;
+  visit_id: string;
+  voice_note_id: string | null;
+
+  title: string;
+  ai_draft: string | null;
+  edited_report: string | null;
+  final_report: string | null;
+  status: string;
+
+  customer_name: string;
+  created_by?: string | null;
+  created_by_name: string;
+
+  submitted_at: string | null;
+  created_at: string;
+
+  approved_at?: string | null;
+  approved_by?: string | null;
+  approved_by_name?: string | null;
+
+  rejected_at?: string | null;
+  rejected_by?: string | null;
+  rejected_by_name?: string | null;
+  rejection_reason?: string | null;
 };
 
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
@@ -455,6 +527,7 @@ export default function App() {
   const [customers, setCustomers] = useState<ApiCustomer[]>([]);
   const [visits, setVisits] = useState<ApiVisit[]>([]);
   const [reports, setReports] = useState<ApiReport[]>([]);
+  const [teamUsers, setTeamUsers] = useState<ApiTeamUser[]>([]);
   const [apiOK, setApiOK] = useState(false);
   const [loading, setLoading] = useState(false);
 
@@ -464,12 +537,15 @@ export default function App() {
   const [selectedVisit, setSelectedVisit] = useState<ApiVisit | null>(null);
   const [selectedCustomerDetail, setSelectedCustomerDetail] = useState<ApiCustomer | null>(null);
   const [selectedReport, setSelectedReport] = useState<ApiReport | null>(null);
+  const [selectedRep, setSelectedRep] = useState<ApiTeamUser | null>(null);
+  const [selectedRepActivity, setSelectedRepActivity] = useState<ApiRepActivity | null>(null);
 
   // ── Recording state
   const [recording, setRecording] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [processingStep, setProcessingStep] = useState("");
   const [seconds, setSeconds] = useState(0);
+  const [micLevel, setMicLevel] = useState(0);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
   const [audioDuration, setAudioDuration] = useState(0);
@@ -487,6 +563,9 @@ export default function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const mimeRef = useRef("audio/webm");
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const micMeterFrameRef = useRef<number | null>(null);
 
   const role = uiRole(user?.role || "");
 
@@ -496,6 +575,22 @@ export default function App() {
   const showModal = (title: string, message: string, type: "success" | "error" | "info" = "info", action?: string) =>
     setModal({ title, message, type, action });
   const closeModal = () => setModal(null);
+
+  async function openRepActivity(member: ApiTeamUser) {
+    setSelectedRep(member);
+    setSelectedRepActivity(null);
+    go("rep-activity");
+    try {
+      const response = await apiGet<{ status?: string; activity?: ApiRepActivity }>(
+        `/users/${encodeURIComponent(member.id)}/activity`
+      );
+      if (!response?.activity) throw new Error("No Field Rep activity data was returned.");
+      setSelectedRepActivity(response.activity);
+    } catch (e: any) {
+      setSelectedRepActivity(null);
+      notify(e?.message || "Could not load Field Rep activity.");
+    }
+  }
 
   // ─── Bootstrap auth ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -528,6 +623,21 @@ export default function App() {
   }, [recording]);
 
   // ─── Data loading ─────────────────────────────────────────────────────────
+  const actionRefreshInFlight = useRef(false);
+
+  const refreshActionItems = useCallback(async () => {
+    if (!user || actionRefreshInFlight.current) return;
+    actionRefreshInFlight.current = true;
+    try {
+      const data = await apiGet<any>("/action-items/");
+      setTasks(data?.action_items || []);
+    } catch {
+      // Keep the last known task state when a silent refresh fails.
+    } finally {
+      actionRefreshInFlight.current = false;
+    }
+  }, [user]);
+
   const load = useCallback(async () => {
     if (!user) return;
     try {
@@ -539,8 +649,9 @@ export default function App() {
         apiGet<any>("/customers/"),
         apiGet<any>("/visits/"),
         apiGet<any>("/reports/"),
+        apiGet<any>("/users/"),
       ]);
-      const [d, t, a, l, c, v, rp] = results;
+      const [d, t, a, l, c, v, rp, tu] = results;
       if (d.status === "fulfilled") setDashboard(d.value);
       if (t.status === "fulfilled") setTasks(t.value.action_items || []);
       if (a.status === "fulfilled") setAlerts(a.value.alerts || []);
@@ -548,6 +659,7 @@ export default function App() {
       if (c.status === "fulfilled") setCustomers(c.value.customers || []);
       if (v.status === "fulfilled") setVisits(v.value.visits || []);
       if (rp.status === "fulfilled") setReports(rp.value.reports || []);
+      if (tu.status === "fulfilled") setTeamUsers(tu.value.users || []);
       const failed = results.filter(x => x.status === "rejected");
       setApiOK(failed.length === 0);
       if (failed.length && !navigator.onLine) notify("Offline: showing the latest available data.");
@@ -566,6 +678,51 @@ export default function App() {
     const x = setInterval(() => load(), 30000);
     return () => clearInterval(x);
   }, [user, load]);
+
+  // ─── Action-item live synchronization ────────────────────────────────────
+  // Management workspaces refresh task state frequently without reloading the
+  // heavier dashboard/report payloads. This gives Manager/Executive views a
+  // near-live reflection of Field Rep task changes across devices.
+  useEffect(() => {
+    if (!user || (role !== "Manager" && role !== "Executive")) return;
+
+    const refresh = () => { void refreshActionItems(); };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+
+    const x = window.setInterval(refresh, 5000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", onVisibility);
+
+    return () => {
+      window.clearInterval(x);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [user, role, refreshActionItems]);
+
+  // ─── Same-browser task event bridge ──────────────────────────────────────
+  // BroadcastChannel complements the server polling above so a Field Rep and
+  // Manager/Executive tab on the same browser can reflect a successful update
+  // immediately. Server state remains the source of truth.
+  useEffect(() => {
+    if (!user || typeof BroadcastChannel === "undefined") return;
+
+    const channel = new BroadcastChannel("fieldvoice_action_items");
+    const onMessage = (event: MessageEvent) => {
+      const data = event.data;
+      if (data?.type !== "ACTION_ITEM_UPDATED") return;
+      if (data?.organization_id && data.organization_id !== user.organization_id) return;
+      void refreshActionItems();
+    };
+
+    channel.addEventListener("message", onMessage);
+    return () => {
+      channel.removeEventListener("message", onMessage);
+      channel.close();
+    };
+  }, [user, refreshActionItems]);
 
   // ─── Offline count ───────────────────────────────────────────────────────
   async function refreshOfflineCount() {
@@ -606,7 +763,7 @@ export default function App() {
   function logout() {
     localStorage.removeItem(TOKEN_KEY);
     setUser(null); setDashboard(null); setTasks([]); setAlerts([]); setLeads([]);
-    setCustomers([]); setVisits([]); setReports([]); setActiveVisit(null);
+    setCustomers([]); setVisits([]); setReports([]); setTeamUsers([]); setActiveVisit(null);
     setReport(null); setGenerated(false); setApiOK(false);
     go("home"); notify("Signed out successfully.");
   }
@@ -685,36 +842,138 @@ export default function App() {
   // ─── Voice recording ─────────────────────────────────────────────────────
   async function startRecording() {
     try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("This browser does not expose microphone recording. Please use the latest Chrome or Edge over localhost.");
+      }
+      if (typeof MediaRecorder === "undefined") {
+        throw new Error("This browser does not support MediaRecorder.");
+      }
+
       chunksRef.current = [];
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setAudioBlob(null);
+      if (audioUrl) URL.revokeObjectURL(audioUrl);
+      setAudioUrl(null);
+      setMicLevel(0);
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: false,
+          autoGainControl: true,
+        },
+      });
       streamRef.current = stream;
 
-      const types = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg", "audio/mp4"];
-      const supported = types.find(t => MediaRecorder.isTypeSupported(t)) || "";
-      mimeRef.current = supported.split(";")[0] || "audio/webm";
+      const track = stream.getAudioTracks()[0];
+      if (!track) throw new Error("No microphone audio track was returned by the browser.");
+
+      // Live microphone diagnostic: shows whether the browser is actually receiving sound.
+      try {
+        const AudioContextCtor = window.AudioContext || (window as any).webkitAudioContext;
+        if (AudioContextCtor) {
+          const ctx: AudioContext = new AudioContextCtor();
+          audioContextRef.current = ctx;
+          if (ctx.state === "suspended") await ctx.resume();
+          const source = ctx.createMediaStreamSource(stream);
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 1024;
+          source.connect(analyser);
+          analyserRef.current = analyser;
+          const buffer = new Uint8Array(analyser.fftSize);
+          const measure = () => {
+            const a = analyserRef.current;
+            if (!a) return;
+            a.getByteTimeDomainData(buffer);
+            let sum = 0;
+            for (let i = 0; i < buffer.length; i += 1) {
+              const v = (buffer[i] - 128) / 128;
+              sum += v * v;
+            }
+            const rms = Math.sqrt(sum / buffer.length);
+            setMicLevel(Math.min(100, Math.round(rms * 220)));
+            micMeterFrameRef.current = requestAnimationFrame(measure);
+          };
+          measure();
+        }
+      } catch (meterError) {
+        console.warn("Microphone meter unavailable:", meterError);
+      }
+
+      const types = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/ogg;codecs=opus",
+        "audio/ogg",
+        "audio/mp4",
+      ];
+      const supported = types.find(t => MediaRecorder.isTypeSupported(t));
+      mimeRef.current = supported || "";
 
       const mr = new MediaRecorder(stream, supported ? { mimeType: supported } : undefined);
       recorderRef.current = mr;
-      mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-      mr.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: mimeRef.current });
-        const url = URL.createObjectURL(blob);
-        setAudioBlob(blob); setAudioUrl(url); setAudioDuration(seconds);
+      mr.ondataavailable = event => {
+        if (event.data && event.data.size > 0) chunksRef.current.push(event.data);
       };
+      mr.onerror = event => {
+        console.error("MediaRecorder error:", event);
+      };
+      mr.onstop = () => {
+        // Let MediaRecorder flush its final data before shutting down the microphone stream.
+        streamRef.current?.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+        if (micMeterFrameRef.current != null) cancelAnimationFrame(micMeterFrameRef.current);
+        micMeterFrameRef.current = null;
+        analyserRef.current = null;
+        audioContextRef.current?.close().catch(() => undefined);
+        audioContextRef.current = null;
+        setMicLevel(0);
+
+        const blobType = mr.mimeType || mimeRef.current || "audio/webm";
+        const blob = new Blob(chunksRef.current, { type: blobType });
+        console.info("FieldVoice recording created:", {
+          bytes: blob.size,
+          mimeType: blob.type,
+          trackSettings: track.getSettings(),
+        });
+        if (!blob.size) {
+          showModal("Empty Recording", "The microphone did not produce an audio file. Check the selected microphone in Chrome and try again.", "error");
+          return;
+        }
+        const url = URL.createObjectURL(blob);
+        setAudioBlob(blob);
+        setAudioUrl(url);
+        setAudioDuration(seconds);
+      };
+
       mr.start(250);
-      setRecording(true); setSeconds(0);
+      setRecording(true);
+      setSeconds(0);
     } catch (e: any) {
-      if (e.name === "NotAllowedError") {
-        showModal("Microphone Permission Denied", "Please allow microphone access in your browser settings and try again.", "error");
+      console.error("Recording start failed:", e);
+      if (e?.name === "NotAllowedError") {
+        showModal("Microphone Permission Denied", "Allow microphone access for localhost:5173 in Chrome, then try again.", "error");
+      } else if (e?.name === "NotFoundError") {
+        showModal("No Microphone Found", "Windows/Chrome cannot find an input microphone. Check your input device and try again.", "error");
       } else {
-        showModal("Recording Error", e.message || "Could not start recording.", "error");
+        showModal("Recording Error", e?.message || "Could not start recording.", "error");
       }
     }
   }
 
   function stopRecording() {
-    recorderRef.current?.stop();
-    streamRef.current?.getTracks().forEach(t => t.stop());
+    const recorder = recorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+    } else {
+      streamRef.current?.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+      if (micMeterFrameRef.current != null) cancelAnimationFrame(micMeterFrameRef.current);
+      micMeterFrameRef.current = null;
+      analyserRef.current = null;
+      audioContextRef.current?.close().catch(() => undefined);
+      audioContextRef.current = null;
+      setMicLevel(0);
+    }
     setRecording(false);
   }
 
@@ -946,11 +1205,37 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
 
   // ─── Task / Alert updates ─────────────────────────────────────────────────
   async function updateTaskStatus(id: string, status: string) {
+    const current = tasks.find(t => t.id === id);
     try {
-      await apiPatch(`/action-items/${id}`, { status });
-      setTasks(prev => prev.map(t => t.id === id ? { ...t, status } : t));
-      notify("Task updated.");
-    } catch (e: any) { notify(`Update failed: ${e.message}`); }
+      const response = await apiPatch<any>(`/action-items/${id}`, { status });
+      const updated = response?.action_item || response?.task || response || {};
+      const nextStatus = String(updated?.status || status);
+
+      // Update the current UI immediately after the backend confirms the change.
+      setTasks(prev => prev.map(t => t.id === id ? { ...t, ...updated, status: nextStatus } : t));
+
+      // Re-read the canonical server state so every role sees exactly what was
+      // persisted (and not only the optimistic local value).
+      await refreshActionItems();
+
+      if (typeof BroadcastChannel !== "undefined") {
+        const channel = new BroadcastChannel("fieldvoice_action_items");
+        channel.postMessage({
+          type: "ACTION_ITEM_UPDATED",
+          id,
+          status: nextStatus,
+          organization_id: user?.organization_id || "",
+          updated_at: updated?.updated_at || new Date().toISOString(),
+        });
+        channel.close();
+      }
+
+      notify(`Task marked ${nextStatus.toLowerCase()}.`);
+    } catch (e: any) {
+      // Restore the previous local value if the backend rejects the update.
+      if (current) setTasks(prev => prev.map(t => t.id === id ? current : t));
+      notify(`Update failed: ${e.message}`);
+    }
   }
 
   async function updateAlertStatus(id: string, status: string) {
@@ -969,7 +1254,6 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
   // ─── Search results ───────────────────────────────────────────────────────
   const searchResults = searchQ.trim().length > 1 ? {
     customers: customers.filter(c => c.name.toLowerCase().includes(searchQ.toLowerCase())).slice(0, 4),
-    leads: leads.filter(l => l.title.toLowerCase().includes(searchQ.toLowerCase())).slice(0, 3),
     tasks: tasks.filter(t => t.title.toLowerCase().includes(searchQ.toLowerCase())).slice(0, 3),
   } : null;
 
@@ -990,7 +1274,6 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
     { id: "home", label: "Dashboard", icon: LayoutDashboard },
     { id: "visits", label: "Team Visits", icon: MapPin },
     { id: "reports", label: "Reports", icon: FileText },
-    { id: "leads", label: "Pipeline", icon: Target },
     { id: "customers", label: "Customers", icon: Users },
     { id: "tasks", label: "Action Items", icon: ClipboardCheck },
     { id: "alerts", label: "Alerts", icon: Bell },
@@ -1002,7 +1285,7 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
   const executiveNav = [
     { id: "home", label: "Executive View", icon: Gauge },
     { id: "reports", label: "Reports", icon: FileText },
-    { id: "leads", label: "Pipeline", icon: Target },
+    { id: "tasks", label: "Action Items", icon: ClipboardCheck },
     { id: "insights", label: "AI Intelligence", icon: Sparkles },
     { id: "map", label: "Territory", icon: Navigation },
     { id: "team", label: "Organization", icon: BriefcaseBusiness },
@@ -1105,14 +1388,6 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
                       </div>
                     ))}
                   </>}
-                  {searchResults.leads.length > 0 && <>
-                    <div className="search-group">Leads</div>
-                    {searchResults.leads.map(l => (
-                      <div key={l.id} className="search-item" onMouseDown={() => { go("leads"); setSearchQ(""); }}>
-                        <Target size={12} />{l.title}
-                      </div>
-                    ))}
-                  </>}
                   {searchResults.tasks.length > 0 && <>
                     <div className="search-group">Tasks</div>
                     {searchResults.tasks.map(t => (
@@ -1121,7 +1396,7 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
                       </div>
                     ))}
                   </>}
-                  {!searchResults.customers.length && !searchResults.leads.length && !searchResults.tasks.length && (
+                  {!searchResults.customers.length && !searchResults.tasks.length && (
                     <div className="search-item" style={{ color: "#6d5963" }}>No results for "{searchQ}"</div>
                   )}
                 </div>
@@ -1182,7 +1457,7 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
               leads={leads} customers={customers} visits={visits} reports={reports}
               report={report} generated={generated} editing={editing}
               recording={recording} processing={processing} processingStep={processingStep}
-              seconds={seconds} audioUrl={audioUrl} audioBlob={audioBlob}
+              seconds={seconds} audioUrl={audioUrl} audioBlob={audioBlob} micLevel={micLevel}
               online={online} user={user} selectedCustomer={selectedCustomer}
               activeVisit={activeVisit} selectedVisit={selectedVisit}
               selectedCustomerDetail={selectedCustomerDetail}
@@ -1193,6 +1468,7 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
               onEmail={() => go("email")} onRecordAgain={() => { discardRecording(); go("record"); }}
               onUpdateTask={updateTaskStatus} onUpdateAlert={updateAlertStatus}
               onOpenCustomer={openCustomer} onOpenVisit={openVisit}
+              onRefresh={load} onNotify={notify}
             />
           )}
           {role === "Manager" && (
@@ -1202,16 +1478,30 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
               user={user} onGo={go} onUpdateTask={updateTaskStatus}
               onUpdateAlert={updateAlertStatus} onOpenCustomer={openCustomer}
               selectedCustomerDetail={selectedCustomerDetail}
+              teamUsers={teamUsers}
+              onOpenRepActivity={openRepActivity}
+              onRefresh={load} onNotify={notify}
             />
           )}
           {role === "Executive" && (
             <ExecutiveViews
               view={view} dashboard={dashboard} alerts={alerts}
-              leads={leads} customers={customers} reports={reports} onGo={go}
+              leads={leads} customers={customers} visits={visits} reports={reports}
+              tasks={tasks} onGo={go} onUpdateTask={updateTaskStatus}
+              user={user} teamUsers={teamUsers} onOpenRepActivity={openRepActivity} onRefresh={load} onNotify={notify}
             />
           )}
 
           {/* SHARED VIEWS (all roles) */}
+          {view === "rep-activity" && selectedRep && (
+            <RepActivityView
+              rep={selectedRep}
+              activity={selectedRepActivity}
+              loading={!selectedRepActivity}
+              onBack={() => go("team")}
+              onRefresh={() => openRepActivity(selectedRep)}
+            />
+          )}
           {view === "settings" && (
             <SettingsView user={user} apiOK={apiOK} onLogout={logout} theme={theme} onThemeChange={setTheme} offlineCount={offlineCount} onClearOffline={clearOfflineQueue} />
           )}
@@ -1263,7 +1553,7 @@ function SalespersonViews(props: any) {
   if (view === "alerts") return <AlertsView {...props} />;
   if (view === "history") return <HistoryView {...props} />;
   if (view === "map") return <TerritoryView customers={props.customers} />;
-  if (view === "settings" || view === "email") return null;
+  if (view === "settings" || view === "email" || view === "rep-activity") return null;
   return <SalesHome {...props} />;
 }
 
@@ -1478,20 +1768,25 @@ function VisitDetailView({ selectedVisit, visits, customers, onGo, onStartVisit 
 // ─── RECORD VIEW ──────────────────────────────────────────────────────────────
 function RecordView({
   customers, activeVisit, selectedCustomer, recording, processing, processingStep,
-  seconds, audioUrl, audioBlob, online, onGo, onStartVisit, onStartRec, onStopRec,
+  seconds, audioUrl, audioBlob, micLevel, online, onGo, onStartVisit, onStartRec, onStopRec,
   onDiscard, onUpload
 }: any) {
   const [playingPreview, setPlayingPreview] = useState(false);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
 
   function togglePreview() {
     if (!audioUrl) return;
-    if (!audioRef.current) { audioRef.current = new Audio(audioUrl); audioRef.current.onended = () => setPlayingPreview(false); }
-    if (playingPreview) { audioRef.current.pause(); setPlayingPreview(false); }
-    else { audioRef.current.play().then(() => setPlayingPreview(true)).catch(() => setPlayingPreview(false)); }
+    const audio = document.querySelector<HTMLAudioElement>(".recorder audio");
+    if (!audio) return;
+    if (playingPreview) {
+      audio.pause();
+      setPlayingPreview(false);
+      return;
+    }
+    audio.play().then(() => setPlayingPreview(true)).catch(error => {
+      console.error("Preview playback failed:", error);
+      setPlayingPreview(false);
+    });
   }
-
-  useEffect(() => () => { audioRef.current?.pause(); }, []);
 
   return (
     <>
@@ -1550,6 +1845,18 @@ function RecordView({
           </div>
 
           {recording && (
+            <div className="source-trace" style={{ margin: "10px 0 4px", justifyContent: "space-between" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <Mic size={15} />
+                <span>{micLevel > 3 ? "Microphone input detected" : "Waiting for microphone input…"}</span>
+              </div>
+              <div style={{ width: 130, height: 5, borderRadius: 999, background: "rgba(255,255,255,.08)", overflow: "hidden" }}>
+                <div style={{ width: `${micLevel}%`, height: "100%", background: "linear-gradient(90deg,#b83b68,#f08aaf)", transition: "width .08s linear" }} />
+              </div>
+            </div>
+          )}
+
+          {recording && (
             <div className="voice-bars">
               {[...Array(20)].map((_, i) => (
                 <span key={i} style={{ animationDelay: `${i * 0.08}s` }} />
@@ -1590,12 +1897,28 @@ function RecordView({
                   {playingPreview ? <Square size={15} /> : <Play size={15} />}
                 </button>
               </div>
+              {audioUrl && (
+                <audio
+                  src={audioUrl}
+                  controls
+                  preload="metadata"
+                  style={{ width: "100%", marginTop: 8, height: 36 }}
+                  onPlay={() => setPlayingPreview(true)}
+                  onPause={() => setPlayingPreview(false)}
+                  onEnded={() => setPlayingPreview(false)}
+                />
+              )}
 
               <div className="rec-bottom">
                 <button className="button ghost" onClick={() => { setPlayingPreview(false); onDiscard(); }}>
                   <Trash2 size={14} /> Discard
                 </button>
-                <button className="button ghost" onClick={() => { setPlayingPreview(false); audioRef.current?.pause(); onDiscard(); }}>
+                <button className="button ghost" onClick={() => {
+                  const audio = document.querySelector<HTMLAudioElement>(".recorder audio");
+                  audio?.pause();
+                  setPlayingPreview(false);
+                  onDiscard();
+                }}>
                   <Mic size={14} /> Record again
                 </button>
                 <button className="button primary" onClick={onUpload}>
@@ -1654,8 +1977,6 @@ function ReportEditorView({ report, editing, setEditing, setReport, onSubmit, on
   const [editedSummary, setEditedSummary] = useState(report?.summary || "");
   const [editedConcerns, setEditedConcerns] = useState<string[]>(report?.concerns || []);
   const [editedActions, setEditedActions] = useState<string[]>(report?.actions || []);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-
   useEffect(() => {
     if (report) {
       setEditedSummary(report.summary || "");
@@ -1668,9 +1989,17 @@ function ReportEditorView({ report, editing, setEditing, setReport, onSubmit, on
 
   function toggleAudio() {
     if (!report.audioUrl) return;
-    if (!audioRef.current) { audioRef.current = new Audio(report.audioUrl); audioRef.current.onended = () => setPlayingAudio(false); }
-    if (playingAudio) { audioRef.current.pause(); setPlayingAudio(false); }
-    else { audioRef.current.play().then(() => setPlayingAudio(true)).catch(() => setPlayingAudio(false)); }
+    const audio = document.querySelector<HTMLAudioElement>(".report-main audio");
+    if (!audio) return;
+    if (playingAudio) {
+      audio.pause();
+      setPlayingAudio(false);
+      return;
+    }
+    audio.play().then(() => setPlayingAudio(true)).catch(error => {
+      console.error("Report audio playback failed:", error);
+      setPlayingAudio(false);
+    });
   }
 
   async function handleSubmit() {
@@ -1728,6 +2057,17 @@ function ReportEditorView({ report, editing, setEditing, setReport, onSubmit, on
               {playingAudio ? <Square size={15} /> : <Play size={15} />}
             </button>
           </div>
+          {report.audioUrl && (
+            <audio
+              src={report.audioUrl}
+              controls
+              preload="metadata"
+              style={{ width: "100%", marginTop: 8, height: 36 }}
+              onPlay={() => setPlayingAudio(true)}
+              onPause={() => setPlayingAudio(false)}
+              onEnded={() => setPlayingAudio(false)}
+            />
+          )}
 
           {/* Transcript */}
           {report.transcript ? (
@@ -1862,14 +2202,35 @@ function AISignalRow({ icon: Icon, label, value }: { icon: any; label: string; v
 }
 
 // ─── REPORTS LIST VIEW ────────────────────────────────────────────────────────
-// ─── REPORTS LIST VIEW ────────────────────────────────────────────────────────
-function ReportsListView({ reports }: any) {
+function ReportsListView({ reports, user, onRefresh, onNotify }: any) {
   const [filter, setFilter] = useState("ALL");
   const [selected, setSelected] = useState<ApiReport | null>(null);
 
   const [voiceNote, setVoiceNote] = useState<ApiVoiceNote | null>(null);
   const [voiceLoading, setVoiceLoading] = useState(false);
   const [voiceError, setVoiceError] = useState("");
+  
+  const [rejecting, setRejecting] = useState(false);
+  const [rejectionReason, setRejectionReason] = useState("");
+  const [actionBusy, setActionBusy] = useState(false);
+
+  const [repEditing, setRepEditing] = useState(false);
+  const [repEditText, setRepEditText] = useState("");
+
+  const isManager =
+  String(user?.role || "").toUpperCase() === "MANAGER";
+
+  const isFieldRep =
+  String(user?.role || "").toUpperCase() === "FIELD_REP" ||
+  String(user?.role || "").toUpperCase() === "SALESPERSON";
+
+  const reportStatusType = (status: string) => {
+    const value = String(status || "").toUpperCase();
+    if (value === "APPROVED") return "success";
+    if (value === "REJECTED") return "error";
+    if (value === "SUBMITTED") return "warn";
+    return "pending";
+  };
 
   const filtered = reports.filter(
     (r: ApiReport) => filter === "ALL" || r.status === filter
@@ -1921,10 +2282,120 @@ function ReportsListView({ reports }: any) {
   }, [selected]);
 
   function closeReport() {
-    setSelected(null);
-    setVoiceNote(null);
-    setVoiceError("");
+  setSelected(null);
+  setVoiceNote(null);
+  setVoiceError("");
+
+  setRejecting(false);
+  setRejectionReason("");
+
+  setRepEditing(false);
+  setRepEditText("");
+
+  setActionBusy(false);
+}
+
+async function approveSelected() {
+  if (!selected?.id || !isManager || selected.status !== "SUBMITTED" || actionBusy) return;
+
+  setActionBusy(true);
+
+  try {
+    const response = await apiPost<{ report?: ApiReport }>(
+      `/reports/${selected.id}/approve`
+    );
+
+    if (response?.report) {
+      setSelected(response.report);
+    }
+
+    await onRefresh?.();
+    onNotify?.("Report approved successfully.");
+  } catch (e: any) {
+    const message = e?.message || "Could not approve the report.";
+    console.error("Report approval failed:", e);
+    onNotify?.(`Approval failed: ${message}`);
+  } finally {
+    setActionBusy(false);
   }
+}
+
+async function rejectSelected() {
+  if (!selected?.id || !isManager || selected.status !== "SUBMITTED" || actionBusy) return;
+
+  const reason = rejectionReason.trim();
+
+  if (!reason) {
+    onNotify?.("Enter a rejection reason before rejecting the report.");
+    return;
+  }
+
+  setActionBusy(true);
+
+  try {
+    const response = await apiPost<{ report?: ApiReport }>(
+      `/reports/${selected.id}/reject`,
+      {
+        rejection_reason: reason,
+      }
+    );
+
+    if (response?.report) {
+      setSelected(response.report);
+    }
+
+    setRejecting(false);
+    setRejectionReason("");
+
+    await onRefresh?.();
+    onNotify?.("Report rejected and returned to the Field Rep.");
+  } catch (e: any) {
+    const message = e?.message || "Could not reject the report.";
+    console.error("Report rejection failed:", e);
+    onNotify?.(`Rejection failed: ${message}`);
+  } finally {
+    setActionBusy(false);
+  }
+}
+
+async function resubmitSelected() {
+  if (!selected?.id || !isFieldRep || selected.status !== "REJECTED" || actionBusy) return;
+
+  const content = repEditText.trim();
+
+  if (!content) {
+    onNotify?.("Add the corrected report content before resubmitting.");
+    return;
+  }
+
+  setActionBusy(true);
+
+  try {
+    await apiPatch(`/reports/${selected.id}/edit`, {
+      edited_report: content,
+    });
+
+    const response = await apiPost<{ report?: ApiReport }>(
+      `/reports/${selected.id}/submit`
+    );
+
+    if (response?.report) {
+      setSelected(response.report);
+    }
+
+    setRepEditing(false);
+    setRepEditText("");
+
+    await onRefresh?.();
+    onNotify?.("Corrected report resubmitted for approval.");
+  } catch (e: any) {
+    const message = e?.message || "Could not resubmit the report.";
+    console.error("Report resubmission failed:", e);
+    onNotify?.(`Resubmission failed: ${message}`);
+  } finally {
+    setActionBusy(false);
+  }
+}
 
   function getAudioUrl(fileUrl: string) {
     if (!fileUrl) return "";
@@ -1946,51 +2417,8 @@ function ReportsListView({ reports }: any) {
         sub="All AI-generated field visit reports. Review content, original field voice, and submission status."
       />
 
-      {/* Report overview — derived entirely from the reports already loaded from the backend. */}
-      <div className="report-overview-grid">
-        {[
-          {
-            label: "Total reports",
-            value: reports.length,
-            icon: FileText,
-            tone: "blue",
-          },
-          {
-            label: "Submitted",
-            value: reports.filter((r: ApiReport) => r.status === "SUBMITTED").length,
-            icon: Send,
-            tone: "green",
-          },
-          {
-            label: "Approved",
-            value: reports.filter((r: ApiReport) => r.status === "APPROVED").length,
-            icon: CircleCheck,
-            tone: "navy",
-          },
-          {
-            label: "Drafts",
-            value: reports.filter((r: ApiReport) => r.status === "DRAFT").length,
-            icon: Edit3,
-            tone: "amber",
-          },
-        ].map(item => {
-          const Icon = item.icon;
-          return (
-            <div className={`report-overview-card ${item.tone}`} key={item.label}>
-              <div className="report-overview-icon">
-                <Icon size={17} />
-              </div>
-              <div className="report-overview-copy">
-                <span>{item.label}</span>
-                <strong>{item.value}</strong>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
       <div className="filter-row">
-        {["ALL", "DRAFT", "EDITED", "SUBMITTED", "APPROVED"].map(f => (
+        {["ALL", "DRAFT", "EDITED", "SUBMITTED", "APPROVED", "REJECTED"].map(f => (
           <button
             key={f}
             className={`pill ${filter === f ? "active-pill" : ""}`}
@@ -2042,11 +2470,7 @@ function ReportsListView({ reports }: any) {
 
                 <Badge
                   label={r.status}
-                  type={
-                    r.status === "SUBMITTED" || r.status === "APPROVED"
-                      ? "success"
-                      : "pending"
-                  }
+                  type={reportStatusType(r.status)}
                 />
 
                 <span style={{ fontSize: 9 }}>
@@ -2098,12 +2522,7 @@ function ReportsListView({ reports }: any) {
             <div className="modal-meta">
               <Badge
                 label={selected.status}
-                type={
-                  selected.status === "SUBMITTED" ||
-                  selected.status === "APPROVED"
-                    ? "success"
-                    : "pending"
-                }
+                type={reportStatusType(selected.status)}
               />
 
               <span>
@@ -2114,6 +2533,313 @@ function ReportsListView({ reports }: any) {
                 By {selected.created_by_name}
               </span>
             </div>
+
+{/* MANAGER REVIEW */}
+{isManager && selected.status === "SUBMITTED" && (
+  <div
+    className="panel"
+    style={{
+      marginTop: 14,
+      padding: 14,
+      border: "1px solid #3a2a32",
+    }}
+  >
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 12,
+      }}
+    >
+      <div>
+        <strong style={{ fontSize: 11 }}>
+          Manager Review
+        </strong>
+
+        <div
+          style={{
+            fontSize: 9,
+            color: "#8d808a",
+            marginTop: 3,
+          }}
+        >
+          Review this Field Rep report before approval.
+        </div>
+      </div>
+
+      {!rejecting && (
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            className="button primary"
+            disabled={actionBusy}
+            onClick={approveSelected}
+          >
+            <CheckCircle2 size={14} />
+            {actionBusy ? "Saving…" : "Approve Report"}
+          </button>
+
+          <button
+            className="button"
+            disabled={actionBusy}
+            onClick={() => setRejecting(true)}
+          >
+            <XCircle size={14} />
+            Reject
+          </button>
+        </div>
+      )}
+    </div>
+
+    {rejecting && (
+      <div style={{ display: "grid", gap: 8, marginTop: 12 }}>
+        <label style={{ fontSize: 9, fontWeight: 700 }}>
+          Reason for rejection *
+        </label>
+
+        <textarea
+          value={rejectionReason}
+          onChange={e => setRejectionReason(e.target.value)}
+          placeholder="Explain what needs to be corrected..."
+          rows={4}
+          style={{
+            width: "100%",
+            resize: "vertical",
+            padding: 10,
+            borderRadius: 9,
+            border: "1px solid rgba(127,113,128,.35)",
+            background: "transparent",
+            color: "inherit",
+            outline: "none",
+            lineHeight: 1.5,
+          }}
+        />
+
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "flex-end",
+            gap: 8,
+          }}
+        >
+          <button
+            className="button"
+            disabled={actionBusy}
+            onClick={() => {
+              setRejecting(false);
+              setRejectionReason("");
+            }}
+          >
+            Cancel
+          </button>
+
+          <button
+            className="button danger"
+            disabled={actionBusy || !rejectionReason.trim()}
+            onClick={rejectSelected}
+          >
+            <XCircle size={14} />
+            {actionBusy ? "Rejecting…" : "Reject Report"}
+          </button>
+        </div>
+      </div>
+    )}
+  </div>
+)}
+
+{/* APPROVAL RESULT */}
+{selected.status === "APPROVED" && (
+  <div
+    className="panel"
+    style={{
+      marginTop: 14,
+      padding: 14,
+      border: "1px solid rgba(76,175,125,.28)",
+      background: "rgba(76,175,125,.06)",
+    }}
+  >
+    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      <CheckCircle2 size={16} style={{ color: "#4caf7d" }} />
+      <strong style={{ color: "#4caf7d" }}>
+        Report Approved
+      </strong>
+    </div>
+
+    <div
+      style={{
+        fontSize: 9,
+        color: "#8d808a",
+        marginTop: 5,
+      }}
+    >
+      {selected.approved_by_name
+        ? `Approved by ${selected.approved_by_name}`
+        : "Approved by Manager"}
+
+      {selected.approved_at
+        ? ` · ${fmtDateTime(selected.approved_at)}`
+        : ""}
+    </div>
+  </div>
+)}
+
+{/* REJECTION RESULT */}
+{selected.status === "REJECTED" && (
+  <div
+    className="panel"
+    style={{
+      marginTop: 14,
+      padding: 14,
+      border: "1px solid rgba(221,90,116,.3)",
+      background: "rgba(221,90,116,.06)",
+    }}
+  >
+    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      <XCircle size={16} style={{ color: "#dd5a74" }} />
+      <strong style={{ color: "#dd5a74" }}>
+        Report Rejected
+      </strong>
+    </div>
+
+    <div
+      style={{
+        marginTop: 10,
+        padding: 10,
+        borderRadius: 8,
+        background: "rgba(221,90,116,.04)",
+        border: "1px solid rgba(221,90,116,.18)",
+      }}
+    >
+      <div
+        style={{
+          fontSize: 8,
+          color: "#6d5963",
+          letterSpacing: "0.08em",
+          marginBottom: 5,
+        }}
+      >
+        REASON FOR REJECTION
+      </div>
+
+      <div
+        style={{
+          fontSize: 10,
+          color: "inherit",
+          lineHeight: 1.55,
+        }}
+      >
+        {selected.rejection_reason || "No reason was provided."}
+      </div>
+
+      <div
+        style={{
+          marginTop: 8,
+          fontSize: 9,
+          color: "#8d808a",
+        }}
+      >
+        {selected.rejected_by_name
+          ? `Rejected by ${selected.rejected_by_name}`
+          : "Rejected by Manager"}
+
+        {selected.rejected_at
+          ? ` · ${fmtDateTime(selected.rejected_at)}`
+          : ""}
+      </div>
+    </div>
+  </div>
+)}
+
+{isFieldRep && selected.status === "REJECTED" && (
+  <div
+    className="panel"
+    style={{
+      marginTop: 14,
+      padding: 14,
+      border: "1px solid rgba(221,90,116,.3)",
+    }}
+  >
+    <strong style={{ fontSize: 11 }}>
+      Correct and resubmit
+    </strong>
+
+    {!repEditing ? (
+      <div style={{ marginTop: 10 }}>
+        <button
+          className="button primary"
+          onClick={() => {
+            setRepEditText(
+              selected.final_report ||
+              selected.edited_report ||
+              selected.ai_draft ||
+              ""
+            );
+            setRepEditing(true);
+          }}
+        >
+          <Edit3 size={14} />
+          Edit Report & Resubmit
+        </button>
+      </div>
+    ) : (
+      <div
+        style={{
+          display: "grid",
+          gap: 8,
+          marginTop: 10,
+        }}
+      >
+        <textarea
+          value={repEditText}
+          onChange={e => setRepEditText(e.target.value)}
+          rows={10}
+          style={{
+            width: "100%",
+            resize: "vertical",
+            padding: 10,
+            borderRadius: 9,
+            border: "1px solid rgba(127,113,128,.35)",
+            background: "transparent",
+            color: "inherit",
+            outline: "none",
+            lineHeight: 1.55,
+          }}
+        />
+
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "flex-end",
+            gap: 8,
+          }}
+        >
+          <button
+            className="button"
+            disabled={actionBusy}
+            onClick={() => {
+              setRepEditing(false);
+              setRepEditText("");
+            }}
+          >
+            Cancel
+          </button>
+
+          <button
+            className="button primary"
+            disabled={actionBusy || !repEditText.trim()}
+            onClick={resubmitSelected}
+          >
+            <Send size={14} />
+            {actionBusy
+              ? "Resubmitting…"
+              : "Resubmit for Approval"}
+          </button>
+        </div>
+      </div>
+    )}
+  </div>
+)}
+
 
             {/* ORIGINAL FIELD VOICE */}
             <div
@@ -2492,52 +3218,202 @@ function CustomerDetailView({ selectedCustomerDetail, visits, reports, tasks, on
 }
 
 // ─── TASKS VIEW ───────────────────────────────────────────────────────────────
-function TasksView({ tasks, onUpdateTask }: any) {
-  const [filter, setFilter] = useState("PENDING");
-  const filtered = tasks.filter((t: ApiActionItem) => filter === "ALL" || t.status === filter);
+function TasksView({ tasks, onUpdateTask, managerMode = false, teamUsers = [], currentUser = null }: any) {
+  const [filter, setFilter] = useState(managerMode ? "ALL" : "PENDING");
+  const [repFilter, setRepFilter] = useState("ALL");
+  const [priorityFilter, setPriorityFilter] = useState("ALL");
+
+  const visibleRepIds = new Set(
+    (teamUsers || [])
+      .filter((u: ApiTeamUser) => {
+        const role = String(u?.role || "").toUpperCase();
+        return role === "FIELD_REP" || role === "SALESPERSON";
+      })
+      .map((u: ApiTeamUser) => String(u.id))
+  );
+
+  const scopedTasks = managerMode
+    ? tasks.filter((t: ApiActionItem) => {
+        const assignee = String(t.assigned_to || "");
+        return assignee === String(currentUser?.id || "") || visibleRepIds.has(assignee);
+      })
+    : tasks;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const next48 = new Date(today);
+  next48.setDate(next48.getDate() + 2);
+
+  const isOpen = (status: string) => {
+    const s = String(status || "").toUpperCase();
+    return s === "PENDING" || s === "IN_PROGRESS";
+  };
+
+  const isOverdue = (task: ApiActionItem) => {
+    if (!task.due_date || !isOpen(task.status)) return false;
+    const due = new Date(task.due_date);
+    due.setHours(0, 0, 0, 0);
+    return due < today;
+  };
+
+  const isDueSoon = (task: ApiActionItem) => {
+    if (!task.due_date || !isOpen(task.status)) return false;
+    const due = new Date(task.due_date);
+    due.setHours(0, 0, 0, 0);
+    return due >= today && due <= next48;
+  };
+
+  const reps = (teamUsers || []).filter((u: ApiTeamUser) => {
+    const role = String(u?.role || "").toUpperCase();
+    return role === "FIELD_REP" || role === "SALESPERSON";
+  });
+
+  const scopedRepName = (task: ApiActionItem) => {
+    if (String(task.assigned_to || "") === String(currentUser?.id || "")) return currentUser?.full_name || "Me";
+    return task.assigned_user_name || reps.find((r: ApiTeamUser) => String(r.id) === String(task.assigned_to))?.full_name || "Unassigned";
+  };
+
+  const openCount = scopedTasks.filter((t: ApiActionItem) => isOpen(t.status)).length;
+  const overdueCount = scopedTasks.filter(isOverdue).length;
+  const dueSoonCount = scopedTasks.filter(isDueSoon).length;
+  const completedCount = scopedTasks.filter((t: ApiActionItem) => String(t.status || "").toUpperCase() === "COMPLETED").length;
+
+  const priorityRank: Record<string, number> = { URGENT: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
+
+  const filtered = scopedTasks
+    .filter((t: ApiActionItem) => filter === "ALL" || String(t.status || "").toUpperCase() === filter)
+    .filter((t: ApiActionItem) => repFilter === "ALL" || String(t.assigned_to || "") === repFilter)
+    .filter((t: ApiActionItem) => priorityFilter === "ALL" || String(t.priority || "").toUpperCase() === priorityFilter)
+    .sort((a: ApiActionItem, b: ApiActionItem) => {
+      const overdueDiff = Number(isOverdue(b)) - Number(isOverdue(a));
+      if (overdueDiff) return overdueDiff;
+      const aDue = a.due_date ? new Date(a.due_date).getTime() : Number.MAX_SAFE_INTEGER;
+      const bDue = b.due_date ? new Date(b.due_date).getTime() : Number.MAX_SAFE_INTEGER;
+      if (aDue !== bDue) return aDue - bDue;
+      const aPriority = priorityRank[String(a.priority || "MEDIUM").toUpperCase()] ?? 9;
+      const bPriority = priorityRank[String(b.priority || "MEDIUM").toUpperCase()] ?? 9;
+      if (aPriority !== bPriority) return aPriority - bPriority;
+      return new Date(String(b.created_at || 0)).getTime() - new Date(String(a.created_at || 0)).getTime();
+    });
+
+  const statusLabel = (status: string) => status === "IN_PROGRESS" ? "IN PROGRESS" : status;
+  const priorityLabel = (priority: string) => String(priority || "MEDIUM").toUpperCase();
+
+  const renderTask = (t: ApiActionItem) => (
+    <article className="action-item-card" key={t.id}>
+      <div className={`action-item-priority ${String(t.priority || "MEDIUM").toLowerCase()}`} aria-hidden="true" />
+      <div className="action-item-icon">
+        <ClipboardCheck size={15} />
+      </div>
+
+      <div className="action-item-content">
+        <div className="action-item-title-row">
+          <div className="action-item-title-block">
+            <span className="action-item-eyebrow">FOLLOW-UP TASK</span>
+            <h3>{t.title}</h3>
+          </div>
+          <Badge label={priorityLabel(t.priority)} type={
+            String(t.priority).toUpperCase() === "HIGH" || String(t.priority).toUpperCase() === "URGENT"
+              ? "error"
+              : String(t.priority).toUpperCase() === "LOW"
+                ? "success"
+                : "warn"
+          } />
+        </div>
+
+        {t.description && <p className="action-item-description">{t.description}</p>}
+
+        <div className="action-item-meta">
+          {t.customer_name && <span><Building2 size={12} />{t.customer_name}</span>}
+          {t.due_date && (
+            <span className={isOverdue(t) ? "task-overdue-meta" : ""}>
+              <Calendar size={12} />{isOverdue(t) ? "Overdue" : isDueSoon(t) ? "Due soon" : "Due"} {fmtDate(t.due_date)}
+            </span>
+          )}
+          {managerMode && <span><Users size={12} />{scopedRepName(t)}</span>}
+          <span><Zap size={12} />{t.source || "AI"} source</span>
+        </div>
+      </div>
+
+      <div className="action-item-status-block">
+        <span className="action-item-status-label">STATUS</span>
+        <select
+          className={`action-item-status-select ${String(t.status).toLowerCase()}`}
+          value={t.status}
+          onChange={e => onUpdateTask(t.id, e.target.value)}
+          aria-label={`Update task status for ${t.title}`}
+        >
+          <option value="PENDING">PENDING</option>
+          <option value="IN_PROGRESS">IN PROGRESS</option>
+          <option value="COMPLETED">COMPLETED</option>
+          <option value="CANCELLED">CANCELLED</option>
+        </select>
+      </div>
+    </article>
+  );
 
   return (
-    <>
-      <SectionHeader eyebrow="ACTION ITEMS" title="Tasks & follow-ups" sub="AI-generated and manual action items from your field visits." />
-      <div className="filter-row">
-        {["ALL", "PENDING", "IN_PROGRESS", "COMPLETED"].map(f => (
-          <button key={f} className={`pill ${filter === f ? "active-pill" : ""}`} onClick={() => setFilter(f)}>{f === "ALL" ? "All" : f.replace("_", " ")}</button>
+    <div className={managerMode ? "manager-followups-page" : undefined}>
+      <SectionHeader
+        eyebrow={managerMode ? "MANAGER FOLLOW-UP" : "ACTION ITEMS"}
+        title={managerMode ? "Follow-up control center" : "Tasks & follow-ups"}
+        sub={managerMode
+          ? "Track your team's outstanding work, overdue commitments, ownership, and completion progress."
+          : "Work extracted from field visits, with clear ownership and completion status."}
+      />
+
+      {managerMode && (
+        <div className="manager-followup-kpis">
+          <div className="manager-followup-kpi"><span>Open</span><strong>{openCount}</strong><small>Pending + in progress</small></div>
+          <div className="manager-followup-kpi overdue"><span>Overdue</span><strong>{overdueCount}</strong><small>Needs immediate follow-up</small></div>
+          <div className="manager-followup-kpi soon"><span>Due soon</span><strong>{dueSoonCount}</strong><small>Next 48 hours</small></div>
+          <div className="manager-followup-kpi completed"><span>Completed</span><strong>{completedCount}</strong><small>Closed follow-ups</small></div>
+        </div>
+      )}
+
+      <div className="filter-row task-filter-row">
+        {["ALL", "PENDING", "IN_PROGRESS", "COMPLETED", ...(managerMode ? ["CANCELLED"] : [])].map(f => (
+          <button
+            key={f}
+            className={`pill ${filter === f ? "active-pill" : ""}`}
+            onClick={() => setFilter(f)}
+          >
+            {f === "ALL" ? "All" : statusLabel(f)}
+          </button>
         ))}
       </div>
-      <div className="panel" style={{ marginTop: 14 }}>
-        {filtered.length === 0 ? <Empty text="No tasks found." icon={ClipboardCheck} /> : (
-          <div style={{ display: "grid", gap: 10 }}>
-            {filtered.map((t: ApiActionItem) => (
-              <div className="task-card" key={t.id}>
-                <div className={`priority-bar ${t.priority?.toLowerCase()}`} />
-                <div style={{ flex: 1 }}>
-                  <strong>{t.title}</strong>
-                  {t.description && <p style={{ fontSize: 9, color: "#8d808a", margin: "3px 0 0" }}>{t.description}</p>}
-                  <div style={{ display: "flex", gap: 8, marginTop: 5 }}>
-                    {t.customer_name && <span style={{ fontSize: 8, color: "#6d5963" }}>{t.customer_name}</span>}
-                    {t.due_date && <span style={{ fontSize: 8, color: "#6d5963" }}>Due: {fmtDate(t.due_date)}</span>}
-                    <span style={{ fontSize: 8, color: "#6d5963" }}>Source: {t.source || "AI"}</span>
-                  </div>
-                </div>
-                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                  <Badge label={t.priority} />
-                  <select
-                    value={t.status}
-                    onChange={e => onUpdateTask(t.id, e.target.value)}
-                    style={{ background: "#1a1018", border: "1px solid #38272f", borderRadius: 8, color: "#c3b2ba", fontSize: 9, padding: "4px 8px" }}
-                  >
-                    <option value="PENDING">PENDING</option>
-                    <option value="IN_PROGRESS">IN PROGRESS</option>
-                    <option value="COMPLETED">COMPLETED</option>
-                    <option value="CANCELLED">CANCELLED</option>
-                  </select>
-                </div>
-              </div>
-            ))}
+
+      {managerMode && (
+        <div className="manager-followup-filter-bar">
+          <label>
+            <span>Field Rep</span>
+            <select value={repFilter} onChange={e => setRepFilter(e.target.value)}>
+              <option value="ALL">All team members</option>
+              {reps.map((rep: ApiTeamUser) => <option key={rep.id} value={rep.id}>{rep.full_name}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>Priority</span>
+            <select value={priorityFilter} onChange={e => setPriorityFilter(e.target.value)}>
+              <option value="ALL">All priorities</option>
+              <option value="URGENT">Urgent</option>
+              <option value="HIGH">High</option>
+              <option value="MEDIUM">Medium</option>
+              <option value="LOW">Low</option>
+            </select>
+          </label>
+          <div className="manager-followup-result-count"><strong>{filtered.length}</strong><span>matching follow-ups</span></div>
+        </div>
+      )}
+
+      <div className="panel tasks-panel" style={{ marginTop: 14 }}>
+        {filtered.length === 0 ? <Empty text={managerMode ? "No follow-ups match the current filters." : "No tasks found."} icon={ClipboardCheck} /> : (
+          <div className="tasks-list">
+            {filtered.map(renderTask)}
           </div>
         )}
       </div>
-    </>
+    </div>
   );
 }
 
@@ -2546,42 +3422,121 @@ function AlertsView({ alerts, onUpdateAlert }: any) {
   const [filter, setFilter] = useState("OPEN");
   const filtered = alerts.filter((a: ApiAlert) => filter === "ALL" || a.status === filter);
 
+  const severityClass = (severity: string) => {
+    const value = String(severity || "").toUpperCase();
+    if (value === "CRITICAL") return "critical";
+    if (value === "HIGH") return "high";
+    if (value === "MEDIUM") return "medium";
+    return "low";
+  };
+
+  const statusClass = (status: string) => {
+    const value = String(status || "").toUpperCase();
+    if (value === "RESOLVED") return "resolved";
+    if (value === "ACKNOWLEDGED") return "acknowledged";
+    if (value === "DISMISSED") return "dismissed";
+    return "open";
+  };
+
   return (
     <>
-      <SectionHeader eyebrow="ALERTS" title="Field alerts" sub="AI-detected risks, opportunities, and urgent items from your field visits." />
-      <div className="filter-row">
-        {["ALL", "OPEN", "ACKNOWLEDGED", "RESOLVED"].map(f => (
-          <button key={f} className={`pill ${filter === f ? "active-pill" : ""}`} onClick={() => setFilter(f)}>{f === "ALL" ? "All" : f}</button>
-        ))}
+      <SectionHeader
+        eyebrow="ALERTS"
+        title="Field alerts"
+        sub="AI-detected risks, opportunities, and urgent items from your field visits."
+      />
+
+      <div className="alert-filter-bar">
+        <div className="alert-filter-tabs" role="tablist" aria-label="Alert status filter">
+          {["ALL", "OPEN", "ACKNOWLEDGED", "RESOLVED"].map(f => (
+            <button
+              key={f}
+              type="button"
+              className={`alert-filter-tab ${filter === f ? "active" : ""}`}
+              onClick={() => setFilter(f)}
+            >
+              {f === "ALL" ? "All" : f === "IN_PROGRESS" ? "In progress" : f}
+            </button>
+          ))}
+        </div>
+        <div className="alert-filter-summary">
+          <span>{filtered.length}</span>
+          <small>{filter === "ALL" ? "total alerts" : `${filter.toLowerCase()} alerts`}</small>
+        </div>
       </div>
-      <div className="panel" style={{ marginTop: 14 }}>
-        {filtered.length === 0 ? <Empty text="No alerts." icon={Bell} /> : (
-          <div style={{ display: "grid", gap: 10 }}>
-            {filtered.map((a: ApiAlert) => (
-              <div className="alert-card" key={a.id}>
-                <div style={{ display: "flex", alignItems: "flex-start", gap: 10, flex: 1 }}>
-                  <AlertTriangle size={16} style={{ color: a.severity === "HIGH" ? "#e05a7a" : a.severity === "MEDIUM" ? "#f5b84b" : "#9c8a94", flexShrink: 0, marginTop: 2 }} />
-                  <div>
-                    <strong>{a.title}</strong>
-                    <p style={{ fontSize: 10, color: "#8d808a", margin: "4px 0 0", lineHeight: 1.5 }}>{a.message}</p>
-                    {a.customer_name && <span style={{ fontSize: 8, color: "#6d5963", marginTop: 4, display: "block" }}>{a.customer_name}</span>}
+
+      <div className="panel field-alerts-panel">
+        {filtered.length === 0 ? (
+          <Empty text={filter === "ALL" ? "No field alerts yet." : `No ${filter.toLowerCase()} alerts.`} icon={Bell} />
+        ) : (
+          <div className="field-alert-list">
+            {filtered.map((a: ApiAlert) => {
+              const severity = severityClass(a.severity);
+              const status = statusClass(a.status);
+
+              return (
+                <article className={`field-alert-card ${severity}`} key={a.id}>
+                  <div className={`field-alert-icon ${severity}`}>
+                    <AlertTriangle size={18} />
                   </div>
-                </div>
-                <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
-                  <Badge label={a.severity} type={a.severity === "HIGH" ? "error" : a.severity === "MEDIUM" ? "warn" : "pending"} />
-                  <select
-                    value={a.status}
-                    onChange={e => onUpdateAlert(a.id, e.target.value)}
-                    style={{ background: "#1a1018", border: "1px solid #38272f", borderRadius: 8, color: "#c3b2ba", fontSize: 9, padding: "4px 8px" }}
-                  >
-                    <option value="OPEN">OPEN</option>
-                    <option value="ACKNOWLEDGED">ACKNOWLEDGED</option>
-                    <option value="RESOLVED">RESOLVED</option>
-                    <option value="DISMISSED">DISMISSED</option>
-                  </select>
-                </div>
-              </div>
-            ))}
+
+                  <div className="field-alert-content">
+                    <div className="field-alert-topline">
+                      <div className="field-alert-labels">
+                        <span className={`field-alert-severity ${severity}`}>{String(a.severity || "LOW").toUpperCase()}</span>
+                        {a.alert_type && (
+                          <span className="field-alert-type">
+                            {String(a.alert_type).replace(/_/g, " ")}
+                          </span>
+                        )}
+                      </div>
+                      <span className={`field-alert-status ${status}`}>
+                        <span className="field-alert-status-dot" />
+                        {String(a.status || "OPEN").replace(/_/g, " ")}
+                      </span>
+                    </div>
+
+                    <h3>{a.title || "Field sales alert"}</h3>
+
+                    <p className="field-alert-message">
+                      {a.message || "This alert was generated from a field activity."}
+                    </p>
+
+                    <div className="field-alert-meta">
+                      {a.customer_name && (
+                        <span>
+                          <Users size={12} />
+                          {a.customer_name}
+                        </span>
+                      )}
+                      {a.created_at && (
+                        <span>
+                          <Clock3 size={12} />
+                          {fmtDateTime(a.created_at)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="field-alert-actions">
+                    <label className="field-alert-status-label" htmlFor={`alert-status-${a.id}`}>
+                      Status
+                    </label>
+                    <select
+                      id={`alert-status-${a.id}`}
+                      className={`field-alert-status-select ${status}`}
+                      value={a.status}
+                      onChange={e => onUpdateAlert(a.id, e.target.value)}
+                    >
+                      <option value="OPEN">Open</option>
+                      <option value="ACKNOWLEDGED">Acknowledged</option>
+                      <option value="RESOLVED">Resolved</option>
+                      <option value="DISMISSED">Dismissed</option>
+                    </select>
+                  </div>
+                </article>
+              );
+            })}
           </div>
         )}
       </div>
@@ -2712,19 +3667,406 @@ function HistoryView({ visits, reports, tasks, alerts, onGo }: any) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // MANAGER VIEWS
 // ═══════════════════════════════════════════════════════════════════════════════
-function ManagerViews({ view, dashboard, tasks, alerts, leads, customers, visits, reports, user, onGo, onUpdateTask, onUpdateAlert, onOpenCustomer, selectedCustomerDetail }: any) {
+function ManagerViews({ view, dashboard, tasks, alerts, leads, customers, visits, reports, user, teamUsers, onGo, onUpdateTask, onUpdateAlert, onOpenCustomer, selectedCustomerDetail, onOpenRepActivity, onRefresh, onNotify }: any) {
   if (view === "home") return <ManagerHome dashboard={dashboard} tasks={tasks} alerts={alerts} leads={leads} visits={visits} onGo={onGo} />;
   if (view === "visits") return <ManagerVisits visits={visits} onGo={onGo} />;
-  if (view === "reports") return <ReportsListView reports={reports} onGo={onGo} />;
-  if (view === "leads") return <LeadsView leads={leads} customers={customers} onGo={onGo} />;
+  if (view === "reports") return <ReportsListView reports={reports} user={user} onRefresh={onRefresh} onNotify={onNotify} onGo={onGo} />;
   if (view === "customers") return <CustomersView customers={customers} onGo={onGo} onOpenCustomer={onOpenCustomer} canStartVisit={false} />;
   if (view === "customer-detail") return <CustomerDetailView selectedCustomerDetail={selectedCustomerDetail} visits={visits} reports={reports} tasks={tasks} onGo={onGo} canStartVisit={false} />;
-  if (view === "tasks") return <TasksView tasks={tasks} onUpdateTask={onUpdateTask} />;
+  if (view === "tasks") return <TasksView tasks={tasks} onUpdateTask={onUpdateTask} managerMode={true} teamUsers={teamUsers} currentUser={user} />;
   if (view === "alerts") return <AlertsView alerts={alerts} onUpdateAlert={onUpdateAlert} />;
-  if (view === "insights") return <InsightsView dashboard={dashboard} alerts={alerts} />;
-  if (view === "team") return <TeamView />;
+  if (view === "insights") return (
+    <ManagerIntelligenceView
+      dashboard={dashboard}
+      teamUsers={teamUsers}
+      visits={visits}
+      reports={reports}
+      tasks={tasks}
+      alerts={alerts}
+      onGo={onGo}
+      onNotify={onNotify}
+    />
+  );
+  if (view === "team") return (
+    <TeamView
+      users={teamUsers}
+      visits={visits}
+      reports={reports}
+      dashboard={dashboard}
+      user={user}
+      onRefresh={onRefresh}
+      onNotify={onNotify}
+      onOpenActivity={onOpenRepActivity}
+      executive={false}
+    />
+  );
   if (view === "map") return <TerritoryView customers={customers} />;
+  // Shared views are rendered below the role-specific router. Do not let the
+  // role router fall back to the dashboard for those routes.
+  if (view === "settings" || view === "email" || view === "rep-activity") return null;
   return <ManagerHome dashboard={dashboard} tasks={tasks} alerts={alerts} leads={leads} visits={visits} onGo={onGo} />;
+}
+
+function ManagerIntelligenceView({
+  dashboard,
+  teamUsers = [],
+  visits = [],
+  reports = [],
+  tasks = [],
+  alerts = [],
+  onGo,
+  onNotify,
+}: any) {
+  const [activityByUser, setActivityByUser] = useState<Record<string, ApiRepActivity>>({});
+  const [loadingActivity, setLoadingActivity] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const onNotifyRef = useRef(onNotify);
+
+  useEffect(() => {
+    onNotifyRef.current = onNotify;
+  }, [onNotify]);
+
+  const reps = useMemo(() => (
+    (teamUsers || []).filter((member: ApiTeamUser) => {
+      const memberRole = String(member.role || "").toUpperCase();
+      return memberRole === "FIELD_REP" || memberRole === "SALESPERSON";
+    })
+  ), [teamUsers]);
+
+  const repIds = useMemo(() => new Set(reps.map((rep: ApiTeamUser) => String(rep.id))), [reps]);
+
+  const scopedVisits = useMemo(
+    () => (visits || []).filter((visit: ApiVisit) => repIds.has(String(visit.user_id))),
+    [visits, repIds]
+  );
+
+  const scopedReports = useMemo(
+    () => (reports || []).filter((report: ApiReport) => repIds.has(String(report.created_by || ""))),
+    [reports, repIds]
+  );
+
+  const scopedTasks = useMemo(
+    () => (tasks || []).filter((task: ApiActionItem) => repIds.has(String(task.assigned_to || ""))),
+    [tasks, repIds]
+  );
+
+  const loadIntelligence = useCallback(async () => {
+    if (!reps.length) {
+      setActivityByUser({});
+      setLastUpdated(new Date());
+      return;
+    }
+
+    setLoadingActivity(true);
+    try {
+      const results = await Promise.allSettled(
+        reps.map(async (rep: ApiTeamUser) => {
+          const response = await apiGet<{ status?: string; activity?: ApiRepActivity }>(
+            `/users/${encodeURIComponent(rep.id)}/activity`
+          );
+          return { id: String(rep.id), activity: response.activity || null };
+        })
+      );
+
+      const next: Record<string, ApiRepActivity> = {};
+      let failed = 0;
+
+      for (const result of results) {
+        if (result.status === "fulfilled" && result.value.activity) {
+          next[result.value.id] = result.value.activity;
+        } else if (result.status === "rejected") {
+          failed += 1;
+        }
+      }
+
+      setActivityByUser(next);
+      setLastUpdated(new Date());
+
+      if (failed > 0) {
+        onNotifyRef.current?.(`${failed} Field Rep activity record${failed === 1 ? "" : "s"} could not be refreshed.`);
+      }
+    } catch (e: any) {
+      onNotifyRef.current?.(e?.message || "Could not load team intelligence.");
+    } finally {
+      setLoadingActivity(false);
+    }
+  }, [reps]);
+
+  useEffect(() => {
+    void loadIntelligence();
+  }, [loadIntelligence]);
+
+  const dayStart = useMemo(() => {
+    const value = new Date();
+    value.setHours(0, 0, 0, 0);
+    return value;
+  }, []);
+
+  const weekStart = useMemo(() => {
+    const value = new Date(dayStart);
+    value.setDate(value.getDate() - 6);
+    return value;
+  }, [dayStart]);
+
+  const visits7d = scopedVisits.filter((visit: ApiVisit) => {
+    const date = new Date(visit.visit_date);
+    return !Number.isNaN(date.getTime()) && date >= weekStart;
+  }).length;
+
+  const reports7d = scopedReports.filter((report: ApiReport) => {
+    const date = new Date(report.created_at);
+    return !Number.isNaN(date.getTime()) && date >= weekStart;
+  }).length;
+
+  const openAlerts = dashboard?.overview?.open_alerts ?? alerts.filter((alert: ApiAlert) => String(alert.status).toUpperCase() === "OPEN").length;
+  const pendingTasks = dashboard?.overview?.pending_action_items ?? scopedTasks.filter((task: ApiActionItem) => {
+    const status = String(task.status || "").toUpperCase();
+    return status === "PENDING" || status === "IN_PROGRESS";
+  }).length;
+
+  type ManagerIntelligenceRow = {
+    rep: ApiTeamUser;
+    activity?: ApiRepActivity;
+    visits: ApiVisit[];
+    reports: ApiReport[];
+    tasks: ApiActionItem[];
+    latestVisit?: ApiVisit;
+  };
+
+  const rows: ManagerIntelligenceRow[] = useMemo<ManagerIntelligenceRow[]>(
+    () =>
+      reps.map((rep: ApiTeamUser): ManagerIntelligenceRow => {
+        const activity = activityByUser[String(rep.id)];
+        const repVisits = scopedVisits.filter(
+          (visit: ApiVisit) => String(visit.user_id) === String(rep.id)
+        );
+        const repReports = scopedReports.filter(
+          (report: ApiReport) => String(report.created_by || "") === String(rep.id)
+        );
+        const repTasks = scopedTasks.filter(
+          (task: ApiActionItem) => String(task.assigned_to || "") === String(rep.id)
+        );
+
+        return {
+          rep,
+          activity,
+          visits: repVisits,
+          reports: repReports,
+          tasks: repTasks,
+          latestVisit: repVisits
+            .slice()
+            .sort(
+              (a: ApiVisit, b: ApiVisit) =>
+                new Date(b.visit_date).getTime() - new Date(a.visit_date).getTime()
+            )[0],
+        };
+      }),
+    [reps, activityByUser, scopedVisits, scopedReports, scopedTasks]
+  );
+
+  const highRiskRows = rows.filter(
+    (row: ManagerIntelligenceRow) =>
+      Number(row.activity?.metrics?.high_risks || 0) > 0
+  );
+
+  const attentionRows = rows
+    .filter((row: ManagerIntelligenceRow) => {
+      const pending = Number(row.activity?.metrics?.pending_action_items || 0);
+      const alertsCount = Number(row.activity?.metrics?.open_alerts || 0);
+      const risks = Number(row.activity?.metrics?.high_risks || 0);
+      return pending > 0 || alertsCount > 0 || risks > 0;
+    })
+    .slice(0, 5);
+
+  const highOpportunities = rows.reduce(
+    (sum: number, row: ManagerIntelligenceRow) =>
+      sum + Number(row.activity?.metrics?.high_opportunities || 0),
+    0
+  );
+
+  const highRisks = rows.reduce(
+    (sum: number, row: ManagerIntelligenceRow) =>
+      sum + Number(row.activity?.metrics?.high_risks || 0),
+    0
+  );
+
+  return (
+    <div className="manager-intelligence-page">
+      <SectionHeader
+        eyebrow="MANAGER INTELLIGENCE"
+        title="Manager intelligence workspace"
+        sub="A live operating view of team activity, AI signals, reporting flow, workload, and areas that need attention."
+        action={
+          <button type="button" className="button ghost" onClick={() => void loadIntelligence()} disabled={loadingActivity}>
+            {loadingActivity ? <Spinner size={12} /> : <RefreshCw size={12} />}
+            {loadingActivity ? "Refreshing…" : "Refresh intelligence"}
+          </button>
+        }
+      />
+
+      <div className="manager-intelligence-kpis">
+        <div className="manager-intelligence-kpi">
+          <span>Team members</span>
+          <strong>{reps.length}</strong>
+          <small>{reps.filter((rep: ApiTeamUser) => rep.is_active !== false).length} active</small>
+        </div>
+        <div className="manager-intelligence-kpi">
+          <span>Visits · 7 days</span>
+          <strong>{visits7d}</strong>
+          <small>Recorded team visits</small>
+        </div>
+        <div className="manager-intelligence-kpi">
+          <span>Reports · 7 days</span>
+          <strong>{reports7d}</strong>
+          <small>Reports created by team</small>
+        </div>
+        <div className="manager-intelligence-kpi alert">
+          <span>Open alerts</span>
+          <strong>{openAlerts}</strong>
+          <small>{pendingTasks} pending follow-ups</small>
+        </div>
+      </div>
+
+      <div className="manager-intelligence-signal-strip">
+        <div className="manager-intelligence-strip-copy">
+          <div className="manager-intelligence-strip-label"><Sparkles size={13} /> AI FIELD SIGNALS</div>
+          <strong>Team-wide signal summary</strong>
+          <span>Signals are derived from the latest server-authorized Field Rep activity.</span>
+        </div>
+        <div className="manager-intelligence-signal-pills">
+          <Badge label={`${highOpportunities} high opportunities`} type="success" />
+          <Badge label={`${highRisks} high risks`} type="error" />
+          {lastUpdated && <span className="manager-intelligence-updated">Updated {fmtDateTime(lastUpdated.toISOString())}</span>}
+        </div>
+      </div>
+
+      {reps.length === 0 ? (
+        <div className="panel" style={{ marginTop: 14 }}>
+          <Empty text="No Field Reps are currently assigned to this Manager." icon={Users} />
+        </div>
+      ) : (
+        <>
+          <div className="manager-intelligence-main-grid">
+            <section className="panel">
+              <PanelTitle
+                title="Team performance"
+                icon={Users}
+                action={<button type="button" className="text-button" onClick={() => onGo("team")}>Open Team <ArrowUpRight size={12} /></button>}
+              />
+              <div className="manager-intelligence-table-wrap">
+                <table className="manager-intelligence-table">
+                  <thead>
+                    <tr>
+                      <th>Field Rep</th>
+                      <th>Visits</th>
+                      <th>Reports</th>
+                      <th>Pending</th>
+                      <th>Alerts</th>
+                      <th>Opportunity</th>
+                      <th>Risk</th>
+                      <th>Sentiment</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((row: ManagerIntelligenceRow) => (
+                      <tr key={row.rep.id}>
+                        <td>
+                          <div className="manager-intelligence-rep">
+                            <div className="avatar">{initials(row.rep.full_name)}</div>
+                            <div>
+                              <strong>{row.rep.full_name}</strong>
+                              <span>{row.latestVisit ? `Last visit ${fmtDate(row.latestVisit.visit_date)}` : "No visits yet"}</span>
+                            </div>
+                          </div>
+                        </td>
+                        <td>{row.activity?.metrics?.visits ?? row.visits.length}</td>
+                        <td>{row.activity?.metrics?.reports ?? row.reports.length}</td>
+                        <td>{row.activity?.metrics?.pending_action_items ?? row.tasks.filter((task: ApiActionItem) => ["PENDING", "IN_PROGRESS"].includes(String(task.status).toUpperCase())).length}</td>
+                        <td>{row.activity?.metrics?.open_alerts ?? 0}</td>
+                        <td><Badge label={String(row.activity?.metrics?.high_opportunities ?? 0)} type="success" /></td>
+                        <td><Badge label={String(row.activity?.metrics?.high_risks ?? 0)} type={Number(row.activity?.metrics?.high_risks || 0) > 0 ? "error" : "success"} /></td>
+                        <td>{row.activity?.latest_insight?.sentiment ? <Badge label={String(row.activity.latest_insight.sentiment)} type="pending" /> : <span>—</span>}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <aside className="panel manager-intelligence-attention-panel">
+              <PanelTitle title="Needs attention" icon={AlertTriangle} action={<button type="button" className="text-button" onClick={() => onGo("tasks")}>Follow-ups <ArrowUpRight size={12} /></button>} />
+              {attentionRows.length === 0 ? (
+                <Empty text="No open team workload needs attention." icon={CheckCircle2} />
+              ) : (
+                <div className="manager-intelligence-attention-list">
+                  {attentionRows.map((row: ManagerIntelligenceRow) => (
+                    <div className="manager-intelligence-attention-item" key={row.rep.id}>
+                      <div className="manager-intelligence-attention-head">
+                        <strong>{row.rep.full_name}</strong>
+                        <StatusChip label={row.rep.is_active === false ? "Inactive" : "Active"} ok={row.rep.is_active !== false} />
+                      </div>
+                      <div className="manager-intelligence-attention-metrics">
+                        <span>{row.activity?.metrics?.pending_action_items ?? 0} pending</span>
+                        <span>{row.activity?.metrics?.open_alerts ?? 0} alerts</span>
+                        <span>{row.activity?.metrics?.high_risks ?? 0} high risk</span>
+                      </div>
+                      {row.activity?.latest_insight?.summary && <p>{row.activity.latest_insight.summary}</p>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </aside>
+          </div>
+
+          <div className="manager-intelligence-secondary-grid">
+            <section className="panel">
+              <PanelTitle title="Recent field activity" icon={Activity} action={<button type="button" className="text-button" onClick={() => onGo("visits")}>All visits <ArrowUpRight size={12} /></button>} />
+              {scopedVisits.length === 0 ? (
+                <Empty text="No team visits yet." icon={MapPin} />
+              ) : (
+                <div className="activity-list">
+                  {scopedVisits
+                    .slice()
+                    .sort((a: ApiVisit, b: ApiVisit) => new Date(b.visit_date).getTime() - new Date(a.visit_date).getTime())
+                    .slice(0, 8)
+                    .map((visit: ApiVisit) => (
+                      <div className="activity-item" key={visit.id}>
+                        <div className={`activity-dot ${String(visit.status).toLowerCase()}`} />
+                        <div className="activity-body">
+                          <strong>{visit.customer_name}</strong>
+                          <span>{visit.user_name} · {fmtDateTime(visit.visit_date)}</span>
+                        </div>
+                        <Badge label={String(visit.status).replace(/_/g, " ")} type={String(visit.status).toUpperCase() === "COMPLETED" ? "success" : "pending"} />
+                      </div>
+                    ))}
+                </div>
+              )}
+            </section>
+
+            <section className="panel">
+              <PanelTitle title="AI signal watch" icon={Sparkles} action={<button type="button" className="text-button" onClick={() => onGo("insights")}>Refresh signals <ArrowUpRight size={12} /></button>} />
+              {highRiskRows.length === 0 ? (
+                <Empty text="No Field Rep has a recorded high-risk signal." icon={ShieldCheck} />
+              ) : (
+                <div className="activity-list">
+                  {highRiskRows.slice(0, 6).map((row: ManagerIntelligenceRow) => (
+                    <div className="activity-item" key={row.rep.id}>
+                      <AlertTriangle size={13} />
+                      <div className="activity-body">
+                        <strong>{row.rep.full_name}</strong>
+                        <span>{row.activity?.latest_insight?.summary || "High-risk activity detected in recent field intelligence."}</span>
+                      </div>
+                      <Badge label={`${row.activity?.metrics?.high_risks ?? 0} high risk`} type="error" />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          </div>
+        </>
+      )}
+    </div>
+  );
 }
 
 function ManagerHome({ dashboard, tasks, alerts, leads, visits, onGo }: any) {
@@ -2743,7 +4085,7 @@ function ManagerHome({ dashboard, tasks, alerts, leads, visits, onGo }: any) {
           <RecentVisits dashboard={dashboard} />
         </div>
         <div className="panel">
-          <PanelTitle title="Pipeline distribution" icon={Target} action={<button className="text-button" onClick={() => onGo("leads")}>View leads <ArrowUpRight size={12} /></button>} />
+          <PanelTitle title="Pipeline distribution" icon={Target} />
           <PipelineBar pipeline={dashboard?.pipeline || []} />
         </div>
       </div>
@@ -2902,16 +4244,449 @@ function InsightsView({ dashboard, alerts }: any) {
   );
 }
 
+
+// ─── EXECUTIVE ORGANIZATION INTELLIGENCE ─────────────────────────────────────
+function ExecutiveOrganizationIntelligenceView({
+  dashboard,
+  alerts = [],
+  leads = [],
+  visits = [],
+  reports = [],
+  tasks = [],
+  teamUsers = [],
+  onGo,
+  onRefresh,
+  onNotify,
+}: {
+  dashboard: DashboardData | null;
+  alerts?: ApiAlert[];
+  leads?: ApiLead[];
+  visits?: ApiVisit[];
+  reports?: ApiReport[];
+  tasks?: ApiActionItem[];
+  teamUsers?: ApiTeamUser[];
+  onGo: (v: View) => void;
+  onRefresh?: () => Promise<void>;
+  onNotify?: (message: string) => void;
+}) {
+  const [activityByUser, setActivityByUser] = useState<Record<string, ApiRepActivity>>({});
+  const [loadingSignals, setLoadingSignals] = useState(false);
+  const loadingSignalsRef = useRef(false);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+
+  const normalizedUsers = useMemo(
+    () => teamUsers
+      .filter((u: ApiTeamUser) => Boolean(u?.id))
+      .map((u: ApiTeamUser) => ({ ...u, role: String(u.role || "").toUpperCase() })),
+    [teamUsers]
+  );
+
+  const managers = useMemo(
+    () => normalizedUsers.filter((u: ApiTeamUser) => String(u.role).toUpperCase() === "MANAGER"),
+    [normalizedUsers]
+  );
+
+  const fieldReps = useMemo(
+    () => normalizedUsers.filter((u: ApiTeamUser) => {
+      const role = String(u.role).toUpperCase();
+      return role === "FIELD_REP" || role === "SALESPERSON";
+    }),
+    [normalizedUsers]
+  );
+
+  const dayStart = useMemo(() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }, []);
+
+  const weekStart = useMemo(() => {
+    const d = new Date(dayStart);
+    d.setDate(d.getDate() - 6);
+    return d;
+  }, [dayStart]);
+
+  const orgVisits7d = useMemo(
+    () => visits.filter((visit: ApiVisit) => {
+      const date = new Date(visit.visit_date);
+      return !Number.isNaN(date.getTime()) && date >= weekStart;
+    }),
+    [visits, weekStart]
+  );
+
+  const orgReports7d = useMemo(
+    () => reports.filter((report: ApiReport) => {
+      const date = new Date(report.created_at);
+      return !Number.isNaN(date.getTime()) && date >= weekStart;
+    }),
+    [reports, weekStart]
+  );
+
+  const openAlerts = dashboard?.overview?.open_alerts ?? alerts.filter(
+    (alert: ApiAlert) => String(alert.status || "").toUpperCase() === "OPEN"
+  ).length;
+
+  const pendingTasks = dashboard?.overview?.pending_action_items ?? tasks.filter(
+    (task: ApiActionItem) => ["PENDING", "IN_PROGRESS"].includes(String(task.status || "").toUpperCase())
+  ).length;
+
+  const activeReps = fieldReps.filter((rep: ApiTeamUser) => rep.is_active !== false).length;
+  const activeManagers = managers.filter((manager: ApiTeamUser) => manager.is_active !== false).length;
+  const unassignedReps = fieldReps.filter((rep: ApiTeamUser) => !rep.manager_id).length;
+  const repsWithVisits7d = new Set(orgVisits7d.map((visit: ApiVisit) => String(visit.user_id))).size;
+  const customersVisited7d = new Set(orgVisits7d.map((visit: ApiVisit) => String(visit.customer_id))).size;
+
+  const reportFlow = useMemo(() => {
+    const counts = { draft: 0, submitted: 0, approved: 0, rejected: 0 };
+    for (const report of reports) {
+      const status = String(report.status || "").toUpperCase();
+      if (status === "APPROVED") counts.approved += 1;
+      else if (status === "REJECTED") counts.rejected += 1;
+      else if (status === "SUBMITTED" || status === "PENDING_REVIEW") counts.submitted += 1;
+      else counts.draft += 1;
+    }
+    return counts;
+  }, [reports]);
+
+  const sentimentData = dashboard?.sentiment || [];
+  const maxSentiment = Math.max(1, ...sentimentData.map((item: { count: number }) => Number(item.count || 0)));
+
+  const latestVisits = useMemo(
+    () => visits
+      .slice()
+      .sort((a: ApiVisit, b: ApiVisit) => new Date(b.visit_date).getTime() - new Date(a.visit_date).getTime())
+      .slice(0, 7),
+    [visits]
+  );
+
+  const latestAlerts = useMemo(
+    () => alerts
+      .filter((alert: ApiAlert) => String(alert.status || "").toUpperCase() !== "RESOLVED")
+      .slice()
+      .sort((a: ApiAlert, b: ApiAlert) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime())
+      .slice(0, 5),
+    [alerts]
+  );
+
+  const latestTasks = useMemo(
+    () => tasks
+      .filter((task: ApiActionItem) => ["PENDING", "IN_PROGRESS"].includes(String(task.status || "").toUpperCase()))
+      .slice()
+      .sort((a: ApiActionItem, b: ApiActionItem) => new Date(a.due_date || a.created_at || 0).getTime() - new Date(b.due_date || b.created_at || 0).getTime())
+      .slice(0, 5),
+    [tasks]
+  );
+
+  const managerRows = useMemo(() => managers.map((manager: ApiTeamUser) => {
+    const reps = fieldReps.filter((rep: ApiTeamUser) => String(rep.manager_id || "") === String(manager.id));
+    const managerRepIds = new Set(reps.map((rep: ApiTeamUser) => String(rep.id)));
+    const managerVisits7d = orgVisits7d.filter((visit: ApiVisit) => managerRepIds.has(String(visit.user_id))).length;
+    const managerReports7d = orgReports7d.filter((report: ApiReport) => managerRepIds.has(String(report.created_by || ""))).length;
+    const managerPending = tasks.filter((task: ApiActionItem) => {
+      const status = String(task.status || "").toUpperCase();
+      return managerRepIds.has(String(task.assigned_to || "")) && (status === "PENDING" || status === "IN_PROGRESS");
+    }).length;
+    return {
+      manager,
+      reps,
+      activeReps: reps.filter((rep: ApiTeamUser) => rep.is_active !== false).length,
+      visits7d: managerVisits7d,
+      reports7d: managerReports7d,
+      pending: managerPending,
+    };
+  }), [managers, fieldReps, orgVisits7d, orgReports7d, tasks]);
+
+  const signalRows = useMemo(() => fieldReps
+    .map((rep: ApiTeamUser) => ({
+      rep,
+      activity: activityByUser[String(rep.id)] || null,
+      latestVisit: visits
+        .filter((visit: ApiVisit) => String(visit.user_id) === String(rep.id))
+        .slice()
+        .sort((a: ApiVisit, b: ApiVisit) => new Date(b.visit_date).getTime() - new Date(a.visit_date).getTime())[0],
+    }))
+    .filter(row => row.activity || row.latestVisit)
+    .sort((a, b) => {
+      const ad = new Date(a.latestVisit?.visit_date || a.activity?.latest_insight?.created_at || 0).getTime();
+      const bd = new Date(b.latestVisit?.visit_date || b.activity?.latest_insight?.created_at || 0).getTime();
+      return bd - ad;
+    })
+    .slice(0, 8), [fieldReps, activityByUser, visits]);
+
+  const loadSignals = useCallback(async () => {
+    if (loadingSignalsRef.current) return;
+    if (!fieldReps.length) {
+      setLastUpdated(new Date());
+      return;
+    }
+    loadingSignalsRef.current = true;
+    setLoadingSignals(true);
+    try {
+      const entries = await Promise.all(
+        fieldReps.map(async (rep: ApiTeamUser) => {
+          try {
+            const response = await apiGet<{ activity?: ApiRepActivity }>(
+              `/users/${encodeURIComponent(rep.id)}/activity`
+            );
+            return response?.activity ? [String(rep.id), response.activity] as const : null;
+          } catch {
+            return null;
+          }
+        })
+      );
+      const next: Record<string, ApiRepActivity> = {};
+      for (const entry of entries) {
+        if (entry) next[entry[0]] = entry[1];
+      }
+      setActivityByUser(next);
+      setLastUpdated(new Date());
+    } finally {
+      loadingSignalsRef.current = false;
+      setLoadingSignals(false);
+    }
+  }, [fieldReps]);
+
+  useEffect(() => {
+    void loadSignals();
+  }, [loadSignals]);
+
+  async function refreshAll() {
+    try {
+      await onRefresh?.();
+      await loadSignals();
+      onNotify?.("Executive intelligence refreshed.");
+    } catch (e: any) {
+      onNotify?.(e?.message || "Could not refresh executive intelligence.");
+    }
+  }
+
+  return (
+    <div className="executive-intelligence-page">
+      <SectionHeader
+        eyebrow="EXECUTIVE INTELLIGENCE"
+        title="Organization intelligence"
+        sub="A live organization-level view of field coverage, reporting flow, AI signals, workload, and management structure."
+        action={(
+          <button type="button" className="button ghost" onClick={() => void refreshAll()} disabled={loadingSignals}>
+            {loadingSignals ? <Spinner size={12} /> : <RefreshCw size={12} />}
+            {loadingSignals ? "Refreshing…" : "Refresh intelligence"}
+          </button>
+        )}
+      />
+
+      <div className="executive-intelligence-kpis">
+        <div className="executive-intelligence-kpi">
+          <span>People</span>
+          <strong>{managers.length + fieldReps.length}</strong>
+          <small>{activeManagers} active managers · {activeReps} active reps · {unassignedReps} unassigned</small>
+        </div>
+        <div className="executive-intelligence-kpi">
+          <span>Visits · 7 days</span>
+          <strong>{orgVisits7d.length}</strong>
+          <small>{repsWithVisits7d} reps active in field · {customersVisited7d} customers visited</small>
+        </div>
+        <div className="executive-intelligence-kpi">
+          <span>Reports · 7 days</span>
+          <strong>{orgReports7d.length}</strong>
+          <small>{reportFlow.submitted} submitted · {reportFlow.approved} approved</small>
+        </div>
+        <div className="executive-intelligence-kpi alert">
+          <span>Attention queue</span>
+          <strong>{openAlerts + pendingTasks}</strong>
+          <small>{openAlerts} open alerts · {pendingTasks} pending follow-ups</small>
+        </div>
+      </div>
+
+      <div className="executive-intelligence-signal-strip">
+        <div className="executive-intelligence-signal-copy">
+          <div className="executive-intelligence-label"><Sparkles size={13} /> ORGANIZATION SIGNALS</div>
+          <strong>Commercial signal snapshot</strong>
+          <span>{dashboard?.overview?.high_opportunities ?? 0} high opportunities · {dashboard?.overview?.high_risks ?? 0} high risks · {dashboard?.overview?.total_leads ?? leads.length} leads in the organization.</span>
+        </div>
+        <div className="executive-intelligence-signal-actions">
+          {lastUpdated && <span className="executive-intelligence-updated">Updated {fmtDateTime(lastUpdated.toISOString())}</span>}
+          <button type="button" className="text-button" onClick={() => onGo("reports")}>Open reports <ArrowUpRight size={12} /></button>
+        </div>
+      </div>
+
+      <div className="executive-intelligence-main-grid">
+        <section className="panel">
+          <PanelTitle title="Management coverage" icon={BriefcaseBusiness} action={<button type="button" className="text-button" onClick={() => onGo("team")}>Open organization <ArrowUpRight size={12} /></button>} />
+          {managerRows.length === 0 ? (
+            <Empty text="No managers are currently available in the organization." icon={Users} />
+          ) : (
+            <div className="executive-intelligence-manager-list">
+              {managerRows.map(row => (
+                <div className="executive-intelligence-manager-row" key={row.manager.id}>
+                  <div className="executive-intelligence-manager-person">
+                    <div className="avatar">{initials(row.manager.full_name)}</div>
+                    <div>
+                      <strong>{row.manager.full_name}</strong>
+                      <span>{row.reps.length} Field Rep{row.reps.length === 1 ? "" : "s"} assigned</span>
+                    </div>
+                  </div>
+                  <div className="executive-intelligence-manager-metrics">
+                    <span><b>{row.activeReps}</b> active</span>
+                    <span><b>{row.visits7d}</b> visits</span>
+                    <span><b>{row.reports7d}</b> reports</span>
+                    <span><b>{row.pending}</b> pending</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section className="panel">
+          <PanelTitle title="AI signal mix" icon={Sparkles} action={<button type="button" className="text-button" onClick={() => void loadSignals()} disabled={loadingSignals}>Refresh signals <RefreshCw size={11} /></button>} />
+          <div className="executive-intelligence-signal-metrics">
+            <div><strong>{dashboard?.overview?.high_opportunities ?? 0}</strong><span>High opportunities</span></div>
+            <div><strong>{dashboard?.overview?.high_risks ?? 0}</strong><span>High risks</span></div>
+            <div><strong>{openAlerts}</strong><span>Open alerts</span></div>
+          </div>
+          <div className="executive-intelligence-sentiment">
+            {sentimentData.length === 0 ? <Empty text="No sentiment data yet." icon={Activity} /> : sentimentData.map((item: { sentiment: string | null; count: number }) => {
+              const count = Number(item.count || 0);
+              return (
+                <div className="executive-intelligence-sentiment-row" key={String(item.sentiment || "Unknown")}>
+                  <span>{item.sentiment || "Unknown"}</span>
+                  <div><i style={{ width: `${Math.max(8, (count / maxSentiment) * 100)}%` }} /></div>
+                  <strong>{count}</strong>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      </div>
+
+      <div className="executive-intelligence-secondary-grid">
+        <section className="panel">
+          <PanelTitle title="Field signal watch" icon={Activity} action={<button type="button" className="text-button" onClick={() => void loadSignals()} disabled={loadingSignals}>Update <RefreshCw size={11} /></button>} />
+          {signalRows.length === 0 ? (
+            <Empty text="No Field Rep activity signals are available yet." icon={Activity} />
+          ) : (
+            <div className="executive-intelligence-signal-list">
+              {signalRows.map(row => {
+                const activity = row.activity;
+                const risk = Number(activity?.metrics?.high_risks || 0);
+                const opportunity = Number(activity?.metrics?.high_opportunities || 0);
+                const sentiment = activity?.latest_insight?.sentiment;
+                return (
+                  <div className="executive-intelligence-signal-item" key={row.rep.id}>
+                    <div className="avatar">{initials(row.rep.full_name)}</div>
+                    <div className="executive-intelligence-signal-body">
+                      <strong>{row.rep.full_name}</strong>
+                      <span>{activity?.latest_insight?.summary || (row.latestVisit ? `Latest visit: ${row.latestVisit.customer_name} · ${fmtDateTime(row.latestVisit.visit_date)}` : "No recent signal summary")}</span>
+                    </div>
+                    <div className="executive-intelligence-signal-tags">
+                      {sentiment && <Badge label={String(sentiment)} type="pending" />}
+                      <Badge label={`${opportunity} opp`} type="success" />
+                      <Badge label={`${risk} risk`} type={risk > 0 ? "error" : "success"} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        <section className="panel">
+          <PanelTitle title="Reporting flow" icon={FileText} action={<button type="button" className="text-button" onClick={() => onGo("reports")}>Review reports <ArrowUpRight size={12} /></button>} />
+          <div className="executive-intelligence-flow-grid">
+            <div><strong>{reportFlow.draft}</strong><span>Draft / other</span></div>
+            <div><strong>{reportFlow.submitted}</strong><span>Submitted</span></div>
+            <div><strong>{reportFlow.approved}</strong><span>Approved</span></div>
+            <div><strong>{reportFlow.rejected}</strong><span>Rejected</span></div>
+          </div>
+          <div className="executive-intelligence-flow-note">
+            <CheckCircle2 size={14} />
+            <span>Report status is shown from the current organization-wide report data.</span>
+          </div>
+        </section>
+      </div>
+
+      <div className="executive-intelligence-bottom-grid">
+        <section className="panel">
+          <PanelTitle title="Recent field activity" icon={MapPin} action={<button type="button" className="text-button" onClick={() => onGo("team")}>Organization <ArrowUpRight size={12} /></button>} />
+          {latestVisits.length === 0 ? <Empty text="No organization visits yet." icon={MapPin} /> : (
+            <div className="activity-list">
+              {latestVisits.map((visit: ApiVisit) => (
+                <div className="activity-item" key={visit.id}>
+                  <div className={`activity-dot ${String(visit.status || "").toLowerCase()}`} />
+                  <div className="activity-body"><strong>{visit.customer_name}</strong><span>{visit.user_name} · {fmtDateTime(visit.visit_date)}</span></div>
+                  <Badge label={String(visit.status || "UNKNOWN").replace(/_/g, " ")} type={String(visit.status).toUpperCase() === "COMPLETED" ? "success" : "pending"} />
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section className="panel">
+          <PanelTitle title="Attention queue" icon={AlertTriangle} action={<button type="button" className="text-button" onClick={() => onGo("tasks")}>Open action items <ArrowUpRight size={12} /></button>} />
+          {latestAlerts.length === 0 && latestTasks.length === 0 ? (
+            <Empty text="No open alerts or pending follow-ups." icon={CheckCircle2} />
+          ) : (
+            <div className="executive-intelligence-queue">
+              {latestAlerts.map((alert: ApiAlert) => (
+                <div className="executive-intelligence-queue-item" key={`alert-${alert.id}`}>
+                  <AlertTriangle size={13} />
+                  <div><strong>{alert.title}</strong><span>{alert.customer_name || "Organization alert"} · {fmtDateTime(alert.created_at)}</span></div>
+                  <Badge label={String(alert.severity || "OPEN")} type="error" />
+                </div>
+              ))}
+              {latestTasks.map((task: ApiActionItem) => (
+                <div className="executive-intelligence-queue-item" key={`task-${task.id}`}>
+                  <ClipboardCheck size={13} />
+                  <div><strong>{task.title}</strong><span>{task.customer_name || "Follow-up"}{task.due_date ? ` · Due ${fmtDate(task.due_date)}` : ""}</span></div>
+                  <Badge label={String(task.priority || "PENDING")} type="pending" />
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      </div>
+    </div>
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // EXECUTIVE VIEWS
 // ═══════════════════════════════════════════════════════════════════════════════
-function ExecutiveViews({ view, dashboard, alerts, leads, customers, reports, onGo }: any) {
+function ExecutiveViews({ view, dashboard, alerts, leads, customers, visits, reports, tasks, user, teamUsers, onGo, onUpdateTask, onOpenRepActivity, onRefresh, onNotify }: any) {
   if (view === "home") return <ExecutiveHome dashboard={dashboard} leads={leads} onGo={onGo} />;
-  if (view === "reports") return <ReportsListView reports={reports} onGo={onGo} />;
-  if (view === "leads") return <LeadsView leads={leads} customers={customers} onGo={onGo} />;
-  if (view === "insights") return <InsightsView dashboard={dashboard} alerts={alerts} />;
+  if (view === "reports") return <ReportsListView reports={reports} user={user} onRefresh={onRefresh} onNotify={onNotify} onGo={onGo} />;
+  if (view === "tasks") return <TasksView tasks={tasks} onUpdateTask={onUpdateTask} />;
+  if (view === "insights") return (
+    <ExecutiveOrganizationIntelligenceView
+      dashboard={dashboard}
+      alerts={alerts}
+      leads={leads}
+      visits={visits}
+      reports={reports}
+      tasks={tasks}
+      teamUsers={teamUsers}
+      onGo={onGo}
+      onRefresh={onRefresh}
+      onNotify={onNotify}
+    />
+  );
   if (view === "map") return <TerritoryView customers={customers} />;
-  if (view === "team") return <TeamView executive />;
+  if (view === "team") return (
+    <TeamView
+      users={teamUsers}
+      visits={visits}
+      reports={reports}
+      dashboard={dashboard}
+      user={user}
+      onRefresh={onRefresh}
+      onNotify={onNotify}
+      onOpenActivity={onOpenRepActivity}
+      executive={true}
+    />
+  );
+  // Shared views are rendered below the role-specific router. Do not let the
+  // role router fall back to the dashboard for those routes.
+  if (view === "settings" || view === "email" || view === "rep-activity") return null;
   return <ExecutiveHome dashboard={dashboard} leads={leads} onGo={onGo} />;
 }
 
@@ -2940,7 +4715,7 @@ function ExecutiveHome({ dashboard, leads, onGo }: { dashboard: DashboardData | 
           </div>
         </div>
         <div className="panel">
-          <PanelTitle title="Pipeline distribution" icon={Target} action={<button className="text-button" onClick={() => onGo("leads")}>View leads <ArrowUpRight size={12} /></button>} />
+          <PanelTitle title="Pipeline distribution" icon={Target} />
           <PipelineBar pipeline={dashboard?.pipeline || []} />
         </div>
       </div>
@@ -3005,30 +4780,672 @@ function TerritoryView({ customers = [] }: { customers?: ApiCustomer[] }) {
 }
 
 // ─── TEAM VIEW ────────────────────────────────────────────────────────────────
-function TeamView({ executive = false }: { executive?: boolean }) {
+function TeamView({
+  executive = false,
+  users = [],
+  visits = [],
+  reports = [],
+  dashboard,
+  user,
+  onRefresh,
+  onNotify,
+  onOpenActivity,
+}: {
+  executive?: boolean;
+  users?: ApiTeamUser[];
+  visits?: ApiVisit[];
+  reports?: ApiReport[];
+  dashboard?: DashboardData | null;
+  user?: AuthUser | null;
+  onRefresh?: () => Promise<void>;
+  onNotify?: (message: string) => void;
+  onOpenActivity?: (member: ApiTeamUser) => Promise<void> | void;
+}) {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [activityByUser, setActivityByUser] = useState<Record<string, ApiRepActivity>>({});
+  const [activityLoadingId, setActivityLoadingId] = useState<string | null>(null);
+  const [activityError, setActivityError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [assigningId, setAssigningId] = useState<string | null>(null);
+
+  const normalizedUsers = users
+    .filter((u: ApiTeamUser) => u?.id)
+    .map((u: ApiTeamUser) => ({
+      ...u,
+      role: String(u.role || "").toUpperCase(),
+    }));
+
+  const fieldReps = normalizedUsers.filter(u => u.role === "FIELD_REP" || u.role === "SALESPERSON");
+  const managers = normalizedUsers.filter(u => u.role === "MANAGER");
+
+  const directTeam = executive
+    ? fieldReps
+    : fieldReps.filter(rep => {
+        if (user?.id && rep.manager_id) return String(rep.manager_id) === String(user.id);
+        return false;
+      });
+
+  const visibleTeam = executive ? fieldReps : directTeam;
+
+  const countVisits = (memberId: string) =>
+    visits.filter((v: ApiVisit) => String(v.user_id) === String(memberId)).length;
+
+  const countReports = (memberId: string) =>
+    reports.filter((r: ApiReport) => String(r.created_by || "") === String(memberId)).length;
+
+  const countSubmitted = (memberId: string) =>
+    reports.filter(
+      (r: ApiReport) =>
+        String(r.created_by || "") === String(memberId) &&
+        String(r.status || "").toUpperCase() === "SUBMITTED"
+    ).length;
+
+  const latestVisit = (memberId: string) =>
+    visits
+      .filter((v: ApiVisit) => String(v.user_id) === String(memberId))
+      .sort(
+        (a: ApiVisit, b: ApiVisit) =>
+          new Date(b.visit_date).getTime() - new Date(a.visit_date).getTime()
+      )[0];
+
+  const activeMembers = visibleTeam.filter(u => u.is_active !== false).length;
+  const teamVisitCount = visibleTeam.reduce((sum, member) => sum + countVisits(member.id), 0);
+  const teamReportCount = visibleTeam.reduce((sum, member) => sum + countReports(member.id), 0);
+
+  async function loadMemberActivity(memberId: string) {
+    if (activityLoadingId === memberId) return;
+
+    if (activityByUser[memberId]) {
+      setActivityError(null);
+      setExpandedId(prev => prev === memberId ? null : memberId);
+      return;
+    }
+
+    setActivityLoadingId(memberId);
+    setActivityError(null);
+    setExpandedId(memberId);
+
+    try {
+      const response = await apiGet<{ status?: string; activity?: ApiRepActivity }>(
+        `/users/${encodeURIComponent(memberId)}/activity`
+      );
+
+      if (!response?.activity) {
+        throw new Error("No Field Rep activity data was returned.");
+      }
+
+      setActivityByUser(prev => ({
+        ...prev,
+        [memberId]: response.activity as ApiRepActivity,
+      }));
+    } catch (e: any) {
+      setActivityError(e?.message || "Could not load Field Rep activity.");
+      setExpandedId(null);
+    } finally {
+      setActivityLoadingId(null);
+    }
+  }
+
+  async function assignManager(repId: string, managerId: string | null) {
+    if (!executive || assigningId) return;
+
+    setAssigningId(repId);
+    try {
+      const response = await apiPatch<any>(`/users/${encodeURIComponent(repId)}/manager`, {
+        manager_id: managerId || null,
+      });
+
+      const message = response?.message || (managerId ? "Field Rep assigned successfully." : "Field Rep manager assignment removed.");
+      onNotify?.(message);
+      setActivityByUser(prev => {
+        const next = { ...prev };
+        delete next[repId];
+        return next;
+      });
+      await onRefresh?.();
+    } catch (e: any) {
+      onNotify?.(`Assignment failed: ${e?.message || "Could not update manager assignment."}`);
+    } finally {
+      setAssigningId(null);
+    }
+  }
+
+  async function refreshTeam() {
+    if (!onRefresh || refreshing) return;
+    setRefreshing(true);
+    try {
+      await onRefresh();
+      setActivityByUser({});
+      setActivityError(null);
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  const statusLabel = (active?: boolean) => active === false ? "Inactive" : "Active";
+
+  const activityStatusBadge = (status: string) => {
+    const value = String(status || "").toUpperCase();
+    if (value === "COMPLETED" || value === "APPROVED") return "success";
+    if (value === "CANCELLED" || value === "REJECTED") return "error";
+    return "pending";
+  };
+
+  const signalBadgeType = (value?: string | null) => {
+    const v = String(value || "").toUpperCase();
+    if (v === "HIGH" || v === "POSITIVE") return "success";
+    if (v === "LOW" || v === "NEGATIVE") return "error";
+    return "pending";
+  };
+
+  const memberCard = (member: ApiTeamUser, nested = false) => {
+    const visitsCount = countVisits(member.id);
+    const reportsCount = countReports(member.id);
+    const submittedCount = countSubmitted(member.id);
+    const lastVisit = latestVisit(member.id);
+    const expanded = expandedId === member.id;
+    const activity = activityByUser[member.id];
+
+    return (
+      <article
+        key={member.id}
+        className="panel"
+        style={{
+          padding: 16,
+          display: "grid",
+          gap: 14,
+          border: "1px solid rgba(184,59,104,.16)",
+          boxShadow: expanded ? "0 10px 30px rgba(20,10,15,.08)" : undefined,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+          <div className="avatar large">{initials(member.full_name)}</div>
+
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <strong style={{ fontSize: 13 }}>{member.full_name}</strong>
+              <Badge label={String(member.role).replace(/_/g, " ")} type="active" />
+              {member.id === user?.id && <Badge label="You" type="success" />}
+            </div>
+
+            <div
+              style={{
+                marginTop: 5,
+                display: "flex",
+                alignItems: "center",
+                gap: 7,
+                flexWrap: "wrap",
+                fontSize: 9,
+                color: "#8d808a",
+              }}
+            >
+              <span>{member.email}</span>
+              {member.phone && <span>· {member.phone}</span>}
+              {member.manager_name && <span>· Manager: {member.manager_name}</span>}
+            </div>
+          </div>
+
+          <StatusChip label={statusLabel(member.is_active)} ok={member.is_active !== false} />
+        </div>
+
+        {executive && (member.role === "FIELD_REP" || member.role === "SALESPERSON") && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 10,
+              flexWrap: "wrap",
+              padding: "10px 0 0",
+              borderTop: "1px solid rgba(141,128,138,.14)",
+            }}
+          >
+            <div>
+              <div style={{ fontSize: 8, letterSpacing: ".08em", color: "#8d808a", fontWeight: 800 }}>
+                MANAGER ASSIGNMENT
+              </div>
+              <div style={{ fontSize: 9, color: "#8d808a", marginTop: 3 }}>
+                {member.manager_name ? `Currently reporting to ${member.manager_name}` : "Currently unassigned"}
+              </div>
+            </div>
+            <select
+              aria-label={`Manager assignment for ${member.full_name}`}
+              value={member.manager_id || ""}
+              disabled={assigningId === member.id}
+              onChange={e => void assignManager(member.id, e.target.value || null)}
+              style={{
+                minWidth: 190,
+                maxWidth: "100%",
+                height: 34,
+                borderRadius: 9,
+                padding: "0 10px",
+                background: "var(--surface, #ffffff)",
+                color: "var(--text, #172d56)",
+                border: "1px solid rgba(141,128,138,.28)",
+                fontSize: 9,
+                outline: "none",
+              }}
+            >
+              <option value="">Unassigned</option>
+              {managers
+                .filter(manager => manager.is_active !== false)
+                .map(manager => (
+                  <option key={manager.id} value={manager.id}>
+                    {manager.full_name}
+                  </option>
+                ))}
+            </select>
+          </div>
+        )}
+
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+            gap: 8,
+          }}
+        >
+          <div className="metric-card" style={{ minHeight: 76 }}>
+            <div className="metric-top"><MapPin size={14} /><span>Visits</span></div>
+            <strong className="metric-value" style={{ fontSize: 18 }}>{visitsCount}</strong>
+          </div>
+
+          <div className="metric-card" style={{ minHeight: 76 }}>
+            <div className="metric-top"><FileText size={14} /><span>Reports</span></div>
+            <strong className="metric-value" style={{ fontSize: 18 }}>{reportsCount}</strong>
+          </div>
+
+          <div className="metric-card" style={{ minHeight: 76 }}>
+            <div className="metric-top"><Send size={14} /><span>Submitted</span></div>
+            <strong className="metric-value" style={{ fontSize: 18 }}>{submittedCount}</strong>
+          </div>
+        </div>
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 10,
+            paddingTop: 2,
+            flexWrap: "wrap",
+          }}
+        >
+          <span style={{ fontSize: 9, color: "#8d808a" }}>
+            Last visit: <strong style={{ color: "inherit" }}>{lastVisit ? fmtDateTime(lastVisit.visit_date) : "No visits yet"}</strong>
+          </span>
+
+          <button
+            type="button"
+            className="button ghost"
+            style={{ padding: "7px 11px", fontSize: 9 }}
+            onClick={() => {
+              if (onOpenActivity) {
+                void onOpenActivity(member);
+              } else {
+                void loadMemberActivity(member.id);
+              }
+            }}
+            disabled={activityLoadingId === member.id}
+          >
+            {activityLoadingId === member.id ? <Spinner size={12} /> : <ExternalLink size={12} />}
+            {activityLoadingId === member.id ? "Loading…" : "View activity"}
+          </button>
+        </div>
+
+        {expanded && activity && (
+          <div
+            style={{
+              borderTop: "1px solid rgba(141,128,138,.18)",
+              paddingTop: 14,
+              display: "grid",
+              gap: 12,
+            }}
+          >
+            <div style={{ fontSize: 8, letterSpacing: ".08em", color: "#8d808a", fontWeight: 800 }}>
+              REP ACTIVITY & PERFORMANCE SNAPSHOT
+            </div>
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))",
+                gap: 8,
+              }}
+            >
+              <Metric icon={MapPin} label="Visits" value={activity.metrics.visits} />
+              <Metric icon={FileText} label="Reports" value={activity.metrics.reports} />
+              <Metric icon={Send} label="Submitted" value={activity.metrics.submitted_reports} />
+              <Metric icon={ClipboardCheck} label="Pending tasks" value={activity.metrics.pending_action_items} />
+              <Metric icon={Bell} label="Open alerts" value={activity.metrics.open_alerts} tone="red" />
+              <Metric icon={Target} label="High opportunities" value={activity.metrics.high_opportunities} tone="green" />
+              <Metric icon={AlertTriangle} label="High risks" value={activity.metrics.high_risks} tone="red" />
+            </div>
+
+            {activity.latest_insight && (
+              <div
+                className="panel"
+                style={{
+                  padding: 12,
+                  background: "var(--surface, #fff)",
+                  border: "1px solid rgba(108,140,255,.18)",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+                  <strong style={{ fontSize: 10 }}>Latest AI field signal</strong>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    {activity.latest_insight.sentiment && <Badge label={activity.latest_insight.sentiment} type={signalBadgeType(activity.latest_insight.sentiment)} />}
+                    {activity.latest_insight.opportunity_level && <Badge label={`Opportunity ${activity.latest_insight.opportunity_level}`} type={signalBadgeType(activity.latest_insight.opportunity_level)} />}
+                    {activity.latest_insight.risk_level && <Badge label={`Risk ${activity.latest_insight.risk_level}`} type={signalBadgeType(activity.latest_insight.risk_level)} />}
+                  </div>
+                </div>
+                <p style={{ margin: "7px 0 0", fontSize: 9, lineHeight: 1.55, color: "#8d808a" }}>
+                  {activity.latest_insight.summary || "No AI summary available."}
+                </p>
+                {activity.latest_insight.created_at && (
+                  <div style={{ marginTop: 6, fontSize: 8, color: "#8d808a" }}>
+                    Updated {fmtDateTime(activity.latest_insight.created_at)}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(270px, 1fr))",
+                gap: 10,
+              }}
+            >
+              <div className="panel" style={{ padding: 12 }}>
+                <PanelTitle title="Recent visits" icon={MapPin} />
+                {activity.recent_visits.length === 0 ? (
+                  <Empty text="No visit activity yet." icon={MapPin} />
+                ) : (
+                  <div className="activity-list">
+                    {activity.recent_visits.map((v, index) => (
+                      <div className="activity-item" key={`${v.id}-${index}`}>
+                        <div className={`activity-dot ${String(v.sentiment || "neutral").toLowerCase()}`} />
+                        <div className="activity-body">
+                          <strong>{v.customer_name}</strong>
+                          <span>{fmtDateTime(v.visit_date)} · {String(v.status || "").replace(/_/g, " ")}</span>
+                        </div>
+                        <Badge label={String(v.visit_type || "VISIT").replace(/_/g, " ")} type={activityStatusBadge(v.status)} />
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="panel" style={{ padding: 12 }}>
+                <PanelTitle title="Recent reports" icon={FileText} />
+                {activity.recent_reports.length === 0 ? (
+                  <Empty text="No reports yet." icon={FileText} />
+                ) : (
+                  <div className="activity-list">
+                    {activity.recent_reports.map(reportItem => (
+                      <div className="activity-item" key={reportItem.id}>
+                        <FileText size={13} />
+                        <div className="activity-body">
+                          <strong>{reportItem.customer_name || reportItem.title}</strong>
+                          <span>{fmtDateTime(reportItem.created_at)} · {reportItem.title}</span>
+                        </div>
+                        <Badge label={String(reportItem.status).replace(/_/g, " ")} type={activityStatusBadge(reportItem.status)} />
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="panel" style={{ padding: 12 }}>
+                <PanelTitle title="Action items" icon={ClipboardCheck} />
+                {activity.action_items.length === 0 ? (
+                  <Empty text="No assigned action items." icon={ClipboardCheck} />
+                ) : (
+                  <div className="activity-list">
+                    {activity.action_items.slice(0, 6).map(item => (
+                      <div className="activity-item" key={item.id}>
+                        <ClipboardCheck size={13} />
+                        <div className="activity-body">
+                          <strong>{item.title}</strong>
+                          <span>{item.customer_name || "No customer"}{item.due_date ? ` · Due ${fmtDate(item.due_date)}` : ""}</span>
+                        </div>
+                        <Badge label={String(item.status).replace(/_/g, " ")} type={activityStatusBadge(item.status)} />
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="panel" style={{ padding: 12 }}>
+                <PanelTitle title="Alerts" icon={Bell} />
+                {activity.alerts.length === 0 ? (
+                  <Empty text="No visible alerts." icon={Bell} />
+                ) : (
+                  <div className="activity-list">
+                    {activity.alerts.slice(0, 6).map(alert => (
+                      <div className="activity-item" key={alert.id}>
+                        <AlertTriangle size={13} />
+                        <div className="activity-body">
+                          <strong>{alert.title}</strong>
+                          <span>{alert.customer_name || "Field activity"} · {String(alert.severity || "").replace(/_/g, " ")}</span>
+                        </div>
+                        <Badge label={String(alert.status).replace(/_/g, " ")} type={activityStatusBadge(alert.status)} />
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {nested && member.manager_name && (
+              <div style={{ fontSize: 9, color: "#8d808a" }}>
+                Reporting to <strong>{member.manager_name}</strong>
+              </div>
+            )}
+          </div>
+        )}
+      </article>
+    );
+  };
+
   return (
     <>
       <SectionHeader
         eyebrow={executive ? "ORGANIZATION" : "TEAM"}
-        title={executive ? "Organization access" : "Team visibility"}
-        sub="Authenticated users are governed by backend RBAC. Role changes are not performed here — they are set in the backend."
+        title={executive ? "Organization intelligence" : "Team workspace"}
+        sub={
+          executive
+            ? "Organization-wide people visibility with manager-to-field-rep relationships and field activity."
+            : "Your assigned Field Reps, their recent field activity, and report progress."
+        }
+        action={
+          <button
+            type="button"
+            className="button ghost"
+            onClick={() => { void refreshTeam(); }}
+            disabled={!onRefresh || refreshing}
+            style={{ minWidth: 90 }}
+          >
+            {refreshing ? <Spinner size={12} /> : <RefreshCw size={12} />}
+            {refreshing ? "Refreshing…" : "Refresh"}
+          </button>
+        }
       />
-      <div className="team-grid">
-        <TeamCard name="Field Representative" role="FIELD_REP" desc="Records visits, voice notes, and submits reports." status="Active" />
-        <TeamCard name="Sales Manager" role="MANAGER" desc="Reviews team reports, manages leads and alerts." status="Active" />
-        <TeamCard name="Executive" role="EXECUTIVE" desc="Views org-level intelligence and pipeline." status="Backend-controlled" />
+
+      {activityError && (
+        <div className="auth-error" style={{ marginBottom: 12 }}>
+          <AlertTriangle size={14} />
+          <span>{activityError}</span>
+        </div>
+      )}
+
+      <div className="metric-grid">
+        <Metric
+          icon={Users}
+          label={executive ? "Field reps" : "My team"}
+          value={visibleTeam.length}
+          sub={executive ? `${managers.length} manager${managers.length === 1 ? "" : "s"}` : "Assigned representatives"}
+        />
+        <Metric icon={CircleCheck} label="Active" value={activeMembers} sub="Currently active" tone="green" />
+        <Metric icon={MapPin} label="Team visits" value={teamVisitCount} sub="Recorded field visits" />
+        <Metric icon={FileText} label="Reports" value={teamReportCount} sub="Created by team" />
       </div>
+
+      {dashboard && !executive && (
+        <div
+          className="panel"
+          style={{
+            marginTop: 10,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            flexWrap: "wrap",
+          }}
+        >
+          <div>
+            <strong style={{ fontSize: 11 }}>Manager activity snapshot</strong>
+            <div style={{ fontSize: 9, color: "#8d808a", marginTop: 4 }}>
+              {dashboard.overview.pending_action_items} pending action items · {dashboard.overview.open_alerts} open alerts across your visible workspace.
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+            <Badge label={`${dashboard.overview.high_opportunities} high opportunities`} type="success" />
+            <Badge label={`${dashboard.overview.high_risks} high risks`} type="error" />
+          </div>
+        </div>
+      )}
+
+      {executive ? (
+        <div style={{ display: "grid", gap: 12, marginTop: 14 }}>
+          {managers.length === 0 ? (
+            <div className="panel">
+              <Empty text="No managers found in this organization." icon={Users} />
+            </div>
+          ) : (
+            managers.map(manager => {
+              const managerReps = fieldReps.filter(
+                rep => String(rep.manager_id || "") === String(manager.id)
+              );
+
+              const managerVisits = managerReps.reduce((sum, rep) => sum + countVisits(rep.id), 0);
+              const managerReports = managerReps.reduce((sum, rep) => sum + countReports(rep.id), 0);
+
+              return (
+                <section key={manager.id} className="panel" style={{ padding: 16 }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: 12,
+                      flexWrap: "wrap",
+                      marginBottom: 12,
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <div className="avatar">{initials(manager.full_name)}</div>
+                      <div>
+                        <strong style={{ fontSize: 12 }}>{manager.full_name}</strong>
+                        <div style={{ fontSize: 9, color: "#8d808a", marginTop: 3 }}>{manager.email}</div>
+                      </div>
+                    </div>
+
+                    <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+                      <Badge label={`${managerReps.length} reps`} />
+                      <Badge label={`${managerVisits} visits`} />
+                      <Badge label={`${managerReports} reports`} />
+                    </div>
+                  </div>
+
+                  {managerReps.length === 0 ? (
+                    <Empty text="No Field Reps assigned to this manager." icon={Users} />
+                  ) : (
+                    <div
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(auto-fit, minmax(270px, 1fr))",
+                        gap: 10,
+                      }}
+                    >
+                      {managerReps.map(rep => memberCard(rep, true))}
+                    </div>
+                  )}
+                </section>
+              );
+            })
+          )}
+
+          {fieldReps.some(rep => !rep.manager_id) && (
+            <section className="panel" style={{ padding: 16 }}>
+              <PanelTitle title="Unassigned Field Reps" icon={Users} />
+              <p style={{ fontSize: 9, color: "#8d808a", margin: "4px 0 10px" }}>
+                These Field Reps are in the organization but currently have no manager assignment.
+              </p>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(270px, 1fr))",
+                  gap: 10,
+                }}
+              >
+                {fieldReps.filter(rep => !rep.manager_id).map(rep => memberCard(rep, true))}
+              </div>
+            </section>
+          )}
+        </div>
+      ) : (
+        <div style={{ marginTop: 14 }}>
+          {visibleTeam.length === 0 ? (
+            <div className="panel">
+              <Empty
+                text="No Field Reps are assigned to you yet. Assign a Field Rep to this Manager from the Executive organization controls."
+                icon={Users}
+              />
+            </div>
+          ) : (
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(290px, 1fr))",
+                gap: 12,
+              }}
+            >
+              {visibleTeam.map(member => memberCard(member))}
+            </div>
+          )}
+        </div>
+      )}
+
       <div className="panel" style={{ marginTop: 14 }}>
-        <PanelTitle title="Role-based access control" icon={ShieldCheck} />
-        <p style={{ fontSize: 10, color: "#8d808a", margin: "8px 0" }}>All permissions are enforced by the backend JWT middleware. There is no frontend role switching.</p>
+        <PanelTitle title={executive ? "Access scope" : "Team data scope"} icon={ShieldCheck} />
+        <p style={{ fontSize: 9, color: "#8d808a", margin: "8px 0 10px", lineHeight: 1.5 }}>
+          {executive
+            ? "Executive view is organization-wide. Manager and Field Rep relationships come from the authenticated backend user records."
+            : "This view shows only Field Reps assigned to the authenticated Manager. Detailed rep activity is loaded from a server-authorized endpoint."}
+        </p>
+
         <div style={{ display: "grid", gap: 8 }}>
           {[
-            { role: "FIELD_REP", access: "Own visits, voice notes, reports, action items, customers" },
-            { role: "MANAGER", access: "Team visits, all reports, leads, alerts, insights, team overview" },
-            { role: "EXECUTIVE", access: "Org-level intelligence, pipeline, all reports, territory" },
-          ].map(r => (
-            <div key={r.role} className="settings-row">
-              <div><strong style={{ fontSize: 10 }}>{r.role}</strong><span style={{ fontSize: 9, color: "#8d808a" }}>{r.access}</span></div>
+            {
+              role: "FIELD_REP",
+              access: "Own visits, voice notes, reports, action items, customers",
+            },
+            {
+              role: "MANAGER",
+              access: "Assigned Field Rep team, team visits, reports, alerts, insights",
+            },
+            {
+              role: "EXECUTIVE",
+              access: "Organization-wide users, reports, intelligence and territory",
+            },
+          ].map(item => (
+            <div key={item.role} className="settings-row">
+              <div>
+                <strong style={{ fontSize: 10 }}>{item.role}</strong>
+                <span style={{ fontSize: 9, color: "#8d808a" }}>{item.access}</span>
+              </div>
               <StatusChip label="Backend enforced" ok />
             </div>
           ))}
@@ -3038,17 +5455,215 @@ function TeamView({ executive = false }: { executive?: boolean }) {
   );
 }
 
-function TeamCard({ name, role, desc, status }: { name: string; role: string; desc: string; status: string }) {
+// ─── FIELD REP ACTIVITY & PERFORMANCE ───────────────────────────────────────
+function RepActivityView({
+  rep,
+  activity,
+  loading,
+  onBack,
+  onRefresh,
+}: {
+  rep: ApiTeamUser;
+  activity: ApiRepActivity | null;
+  loading: boolean;
+  onBack: () => void;
+  onRefresh: () => Promise<void> | void;
+}) {
+  const signalType = (value?: string | null) => {
+    const v = String(value || "").toUpperCase();
+    if (v === "HIGH" || v === "POSITIVE") return "success";
+    if (v === "LOW" || v === "NEGATIVE") return "error";
+    return "pending";
+  };
+
+  const statusType = (value?: string | null) => {
+    const v = String(value || "").toUpperCase();
+    if (v === "COMPLETED" || v === "APPROVED") return "success";
+    if (v === "CANCELLED" || v === "REJECTED") return "error";
+    return "pending";
+  };
+
+  const events = activity ? [
+    ...activity.recent_visits.map(v => ({
+      id: `visit-${v.id}`,
+      date: v.visit_date,
+      kind: "Visit",
+      title: v.customer_name,
+      detail: `${String(v.visit_type || "CUSTOMER VISIT").replace(/_/g, " ")} · ${String(v.status || "").replace(/_/g, " ")}`,
+      icon: MapPin,
+    })),
+    ...activity.recent_reports.map(r => ({
+      id: `report-${r.id}`,
+      date: r.created_at,
+      kind: "Report",
+      title: r.customer_name || r.title,
+      detail: `${r.title} · ${String(r.status || "").replace(/_/g, " ")}`,
+      icon: FileText,
+    })),
+    ...activity.action_items.map(a => ({
+      id: `task-${a.id}`,
+      date: a.due_date || null,
+      kind: "Action",
+      title: a.title,
+      detail: `${a.customer_name || "No customer"} · ${String(a.status || "").replace(/_/g, " ")}`,
+      icon: ClipboardCheck,
+    })),
+    ...activity.alerts.map(a => ({
+      id: `alert-${a.id}`,
+      date: a.created_at || null,
+      kind: "Alert",
+      title: a.title,
+      detail: `${a.customer_name || "Field activity"} · ${String(a.severity || "").replace(/_/g, " ")}`,
+      icon: AlertTriangle,
+    })),
+  ]
+    .filter(e => !!e.date)
+    .sort((a, b) => new Date(String(b.date)).getTime() - new Date(String(a.date)).getTime())
+    .slice(0, 12)
+    : [];
+
   return (
-    <div className="panel team-card">
-      <div className="avatar large">{initials(name)}</div>
-      <div>
-        <h3>{name}</h3>
-        <span className="badge">{role}</span>
-        <p style={{ fontSize: 9, color: "#8d808a", margin: "6px 0 0", lineHeight: 1.5 }}>{desc}</p>
+    <>
+      <div className="rep-activity-back-row">
+        <button type="button" className="button ghost" onClick={onBack}>
+          <ChevronDown size={13} style={{ transform: "rotate(90deg)" }} />
+          Back to Team
+        </button>
+        <button type="button" className="button ghost" onClick={() => void onRefresh()} disabled={loading}>
+          {loading ? <Spinner size={12} /> : <RefreshCw size={12} />}
+          {loading ? "Refreshing…" : "Refresh activity"}
+        </button>
       </div>
-      <StatusChip label={status} ok={status === "Active"} />
-    </div>
+
+      <SectionHeader
+        eyebrow="FIELD REP PERFORMANCE"
+        title={rep.full_name}
+        sub="Detailed field activity, report progress, action workload, alerts, and the latest AI field signal."
+      />
+
+      <div className="rep-profile-hero panel">
+        <div className="rep-profile-main">
+          <div className="avatar huge">{initials(rep.full_name)}</div>
+          <div className="rep-profile-copy">
+            <div className="rep-profile-name-row">
+              <h2>{rep.full_name}</h2>
+              <Badge label={String(rep.role || "FIELD_REP").replace(/_/g, " ")} type="active" />
+              <StatusChip label={rep.is_active === false ? "Inactive" : "Active"} ok={rep.is_active !== false} />
+            </div>
+            <p>{rep.email}{rep.phone ? ` · ${rep.phone}` : ""}</p>
+            <div className="rep-profile-meta">
+              <span>Reporting manager</span>
+              <strong>{rep.manager_name || "Unassigned"}</strong>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {loading && !activity ? (
+        <div className="panel rep-loading-panel">
+          <Spinner size={28} />
+          <strong>Loading Field Rep activity…</strong>
+          <span>Fetching the latest server-authorized performance data.</span>
+        </div>
+      ) : !activity ? (
+        <div className="panel"><Empty text="No Field Rep activity data is available." icon={Activity} /></div>
+      ) : (
+        <>
+          <div className="rep-kpi-grid">
+            <Metric icon={MapPin} label="Visits" value={activity.metrics.visits} sub="Recorded visits" />
+            <Metric icon={FileText} label="Reports" value={activity.metrics.reports} sub="Created reports" />
+            <Metric icon={Send} label="Submitted" value={activity.metrics.submitted_reports} sub="Submitted reports" />
+            <Metric icon={ClipboardCheck} label="Pending tasks" value={activity.metrics.pending_action_items} sub="Open workload" />
+            <Metric icon={Bell} label="Open alerts" value={activity.metrics.open_alerts} sub="Needs attention" tone="red" />
+            <Metric icon={Target} label="High opportunities" value={activity.metrics.high_opportunities} sub="AI signal" tone="green" />
+            <Metric icon={AlertTriangle} label="High risks" value={activity.metrics.high_risks} sub="AI signal" tone="red" />
+          </div>
+
+          {activity.latest_insight && (
+            <div className="panel rep-ai-panel">
+              <div className="panel-title">
+                <div><Sparkles size={15} /><h3>Latest AI field signal</h3></div>
+                <div className="rep-signal-badges">
+                  {activity.latest_insight.sentiment && <Badge label={activity.latest_insight.sentiment} type={signalType(activity.latest_insight.sentiment)} />}
+                  {activity.latest_insight.opportunity_level && <Badge label={`Opportunity ${activity.latest_insight.opportunity_level}`} type={signalType(activity.latest_insight.opportunity_level)} />}
+                  {activity.latest_insight.risk_level && <Badge label={`Risk ${activity.latest_insight.risk_level}`} type={signalType(activity.latest_insight.risk_level)} />}
+                </div>
+              </div>
+              <p>{activity.latest_insight.summary || "No AI summary available."}</p>
+              {activity.latest_insight.created_at && <span>Updated {fmtDateTime(activity.latest_insight.created_at)}</span>}
+            </div>
+          )}
+
+          <div className="rep-activity-grid">
+            <div className="panel">
+              <PanelTitle title="Recent activity" icon={Activity} />
+              {events.length === 0 ? <Empty text="No recent activity yet." icon={Activity} /> : (
+                <div className="rep-timeline">
+                  {events.map(event => {
+                    const Icon = event.icon;
+                    return (
+                      <div className="rep-timeline-item" key={event.id}>
+                        <div className="rep-timeline-icon"><Icon size={13} /></div>
+                        <div className="rep-timeline-content">
+                          <div className="rep-timeline-top"><span>{event.kind}</span><time>{fmtDateTime(event.date)}</time></div>
+                          <strong>{event.title}</strong>
+                          <p>{event.detail}</p>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="panel">
+              <PanelTitle title="Recent reports" icon={FileText} />
+              {activity.recent_reports.length === 0 ? <Empty text="No reports yet." icon={FileText} /> : (
+                <div className="activity-list">
+                  {activity.recent_reports.map(item => (
+                    <div className="activity-item" key={item.id}>
+                      <FileText size={13} />
+                      <div className="activity-body"><strong>{item.customer_name || item.title}</strong><span>{item.title} · {fmtDateTime(item.created_at)}</span></div>
+                      <Badge label={String(item.status).replace(/_/g, " ")} type={statusType(item.status)} />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="panel">
+              <PanelTitle title="Action items" icon={ClipboardCheck} />
+              {activity.action_items.length === 0 ? <Empty text="No assigned action items." icon={ClipboardCheck} /> : (
+                <div className="activity-list">
+                  {activity.action_items.slice(0, 8).map(item => (
+                    <div className="activity-item" key={item.id}>
+                      <ClipboardCheck size={13} />
+                      <div className="activity-body"><strong>{item.title}</strong><span>{item.customer_name || "No customer"}{item.due_date ? ` · Due ${fmtDate(item.due_date)}` : ""}</span></div>
+                      <Badge label={String(item.status).replace(/_/g, " ")} type={statusType(item.status)} />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="panel">
+              <PanelTitle title="Alerts" icon={Bell} />
+              {activity.alerts.length === 0 ? <Empty text="No visible alerts." icon={Bell} /> : (
+                <div className="activity-list">
+                  {activity.alerts.slice(0, 8).map(item => (
+                    <div className="activity-item" key={item.id}>
+                      <AlertTriangle size={13} />
+                      <div className="activity-body"><strong>{item.title}</strong><span>{item.customer_name || "Field activity"} · {String(item.severity || "").replace(/_/g, " ")}</span></div>
+                      <Badge label={String(item.status).replace(/_/g, " ")} type={statusType(item.status)} />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+    </>
   );
 }
 
@@ -3100,12 +5715,21 @@ function SettingsView({
   ];
 
   return (
-    <>
-      <SectionHeader
-        eyebrow="SETTINGS"
-        title="Account & preferences"
-        sub="Manage your FieldVoice appearance, account details, privacy controls, notifications, and session information."
-      />
+    <div className="settings-page">
+      <div className="settings-page-header">
+        <div className="settings-page-heading">
+          <div className="settings-page-icon"><Settings size={20} /></div>
+          <div>
+            <span className="eyebrow">SETTINGS</span>
+            <h1>Account & preferences</h1>
+            <p>Manage your FieldVoice appearance, account details, privacy controls, notifications, and session information.</p>
+          </div>
+        </div>
+        <div className="settings-page-status">
+          <span className={`settings-status-dot ${apiOK ? "online" : "offline"}`} />
+          {apiOK ? "Workspace connected" : "Workspace offline"}
+        </div>
+      </div>
 
       <div className="settings-shell">
         <aside className="panel settings-tabs-card">
@@ -3255,7 +5879,7 @@ function SettingsView({
           )}
         </section>
       </div>
-    </>
+    </div>
   );
 }
 
