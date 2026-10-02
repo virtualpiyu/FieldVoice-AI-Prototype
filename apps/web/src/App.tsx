@@ -21,7 +21,7 @@ type Role = "Salesperson" | "Manager" | "Executive";
 type Theme = "light" | "dark";
 type View =
   | "home" | "visits" | "visit-detail" | "record" | "report" | "email"
-  | "reports" | "tasks" | "insights" | "map" | "team" | "rep-activity" | "settings"
+  | "reports" | "tasks" | "insights" | "map" | "team" | "organization" | "rep-activity" | "settings"
   | "customers" | "customer-detail" | "leads" | "history" | "alerts";
 
 type Report = {
@@ -1288,7 +1288,7 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
     { id: "tasks", label: "Action Items", icon: ClipboardCheck },
     { id: "insights", label: "AI Intelligence", icon: Sparkles },
     { id: "map", label: "Territory", icon: Navigation },
-    { id: "team", label: "Organization", icon: BriefcaseBusiness },
+    { id: "organization", label: "Organization", icon: BriefcaseBusiness },
     { id: "settings", label: "Settings", icon: Settings },
   ];
 
@@ -4248,13 +4248,11 @@ function InsightsView({ dashboard, alerts }: any) {
 // ─── EXECUTIVE ORGANIZATION INTELLIGENCE ─────────────────────────────────────
 function ExecutiveOrganizationIntelligenceView({
   dashboard,
-  alerts = [],
-  leads = [],
   visits = [],
   reports = [],
-  tasks = [],
   teamUsers = [],
   onGo,
+  onOpenRepActivity,
   onRefresh,
   onNotify,
 }: {
@@ -4266,324 +4264,381 @@ function ExecutiveOrganizationIntelligenceView({
   tasks?: ApiActionItem[];
   teamUsers?: ApiTeamUser[];
   onGo: (v: View) => void;
+  onOpenRepActivity?: (member: ApiTeamUser) => void;
   onRefresh?: () => Promise<void>;
   onNotify?: (message: string) => void;
 }) {
-  const [activityByUser, setActivityByUser] = useState<Record<string, ApiRepActivity>>({});
-  const [loadingSignals, setLoadingSignals] = useState(false);
-  const loadingSignalsRef = useRef(false);
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  type RegionRow = {
+    id: string;
+    name: string;
+    description?: string | null;
+    city?: string | null;
+    state?: string | null;
+    country?: string | null;
+    is_active?: boolean;
+    manager_count?: number;
+    rep_count?: number;
+    customer_count?: number;
+    visit_count?: number;
+  };
+  type TreeRep = ApiTeamUser & {
+    territory_id?: string | null;
+    territory_name?: string | null;
+    visit_count?: number;
+    report_count?: number;
+  };
+  type TreeManager = ApiTeamUser & {
+    regions: Array<{ territory_id: string; territory_name: string; assigned_at?: string | null; is_active?: boolean }>;
+    field_reps: TreeRep[];
+    field_rep_count?: number;
+  };
 
-  const normalizedUsers = useMemo(
-    () => teamUsers
-      .filter((u: ApiTeamUser) => Boolean(u?.id))
-      .map((u: ApiTeamUser) => ({ ...u, role: String(u.role || "").toUpperCase() })),
-    [teamUsers]
-  );
+  const [regions, setRegions] = useState<RegionRow[]>([]);
+  const [managers, setManagers] = useState<TreeManager[]>([]);
+  const [selectedRegionId, setSelectedRegionId] = useState("");
+  const [selectedManagerId, setSelectedManagerId] = useState("");
+  const [search, setSearch] = useState("");
+  const [appliedSearch, setAppliedSearch] = useState("");
+  const [loadingOrg, setLoadingOrg] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [selectedManager, setSelectedManager] = useState<TreeManager | null>(null);
+  const [selectedRep, setSelectedRep] = useState<TreeRep | null>(null);
+  const [creatingEmployee, setCreatingEmployee] = useState(false);
+  const [employeeBusy, setEmployeeBusy] = useState(false);
+  const [employeeForm, setEmployeeForm] = useState({
+    full_name: "",
+    email: "",
+    phone: "",
+    role: "FIELD_REP",
+    password: "Temp@1234",
+    manager_id: "",
+    territory_id: "",
+    region_ids: [] as string[],
+  });
 
-  const managers = useMemo(
-    () => normalizedUsers.filter((u: ApiTeamUser) => String(u.role).toUpperCase() === "MANAGER"),
-    [normalizedUsers]
-  );
+  const isExecutive = String(localStorage.getItem(TOKEN_KEY) || "").length > 0;
 
-  const fieldReps = useMemo(
-    () => normalizedUsers.filter((u: ApiTeamUser) => {
-      const role = String(u.role).toUpperCase();
-      return role === "FIELD_REP" || role === "SALESPERSON";
-    }),
-    [normalizedUsers]
-  );
+  const regionById = useMemo(() => {
+    const map = new Map<string, RegionRow>();
+    for (const region of regions) map.set(String(region.id), region);
+    return map;
+  }, [regions]);
 
-  const dayStart = useMemo(() => {
-    const d = new Date();
-    d.setHours(0, 0, 0, 0);
-    return d;
-  }, []);
+  const teamFromTree = useMemo(() => managers.flatMap(m => m.field_reps || []), [managers]);
 
-  const weekStart = useMemo(() => {
-    const d = new Date(dayStart);
-    d.setDate(d.getDate() - 6);
-    return d;
-  }, [dayStart]);
+  const scopedVisitCount = useMemo(() => {
+    const visibleUserIds = new Set(teamFromTree.map(rep => String(rep.id)));
+    if (!visibleUserIds.size && !selectedManagerId) return visits.length;
+    return visits.filter(v => visibleUserIds.has(String(v.user_id))).length;
+  }, [visits, teamFromTree, selectedManagerId]);
 
-  const orgVisits7d = useMemo(
-    () => visits.filter((visit: ApiVisit) => {
-      const date = new Date(visit.visit_date);
-      return !Number.isNaN(date.getTime()) && date >= weekStart;
-    }),
-    [visits, weekStart]
-  );
+  const scopedReportCount = useMemo(() => {
+    const visibleUserIds = new Set(teamFromTree.map(rep => String(rep.id)));
+    if (!visibleUserIds.size && !selectedManagerId) return reports.length;
+    return reports.filter(r => visibleUserIds.has(String(r.created_by || ""))).length;
+  }, [reports, teamFromTree, selectedManagerId]);
 
-  const orgReports7d = useMemo(
-    () => reports.filter((report: ApiReport) => {
-      const date = new Date(report.created_at);
-      return !Number.isNaN(date.getTime()) && date >= weekStart;
-    }),
-    [reports, weekStart]
-  );
+  const scopedCompletedVisits = useMemo(() => {
+    const visibleUserIds = new Set(teamFromTree.map(rep => String(rep.id)));
+    const source = visibleUserIds.size ? visits.filter(v => visibleUserIds.has(String(v.user_id))) : visits;
+    return source.filter(v => String(v.status || "").toUpperCase() === "COMPLETED").length;
+  }, [visits, teamFromTree]);
 
-  const openAlerts = dashboard?.overview?.open_alerts ?? alerts.filter(
-    (alert: ApiAlert) => String(alert.status || "").toUpperCase() === "OPEN"
-  ).length;
+  const scopedApprovedReports = useMemo(() => {
+    const visibleUserIds = new Set(teamFromTree.map(rep => String(rep.id)));
+    const source = visibleUserIds.size ? reports.filter(r => visibleUserIds.has(String(r.created_by || ""))) : reports;
+    return source.filter(r => String(r.status || "").toUpperCase() === "APPROVED").length;
+  }, [reports, teamFromTree]);
 
-  const pendingTasks = dashboard?.overview?.pending_action_items ?? tasks.filter(
-    (task: ApiActionItem) => ["PENDING", "IN_PROGRESS"].includes(String(task.status || "").toUpperCase())
-  ).length;
+  const activeRepCount = teamFromTree.filter(r => r.is_active !== false).length;
+  const managerRegionCount = selectedManager ? selectedManager.regions.length : new Set(managers.flatMap(m => m.regions.map(r => r.territory_id))).size;
+  const selectedRegion = selectedRegionId ? regionById.get(selectedRegionId) : null;
 
-  const activeReps = fieldReps.filter((rep: ApiTeamUser) => rep.is_active !== false).length;
-  const activeManagers = managers.filter((manager: ApiTeamUser) => manager.is_active !== false).length;
-  const unassignedReps = fieldReps.filter((rep: ApiTeamUser) => !rep.manager_id).length;
-  const repsWithVisits7d = new Set(orgVisits7d.map((visit: ApiVisit) => String(visit.user_id))).size;
-  const customersVisited7d = new Set(orgVisits7d.map((visit: ApiVisit) => String(visit.customer_id))).size;
+  const visibleManagers = useMemo(() => {
+    if (!selectedManagerId) return managers;
+    return managers.filter(m => String(m.id) === String(selectedManagerId));
+  }, [managers, selectedManagerId]);
 
-  const reportFlow = useMemo(() => {
-    const counts = { draft: 0, submitted: 0, approved: 0, rejected: 0 };
-    for (const report of reports) {
-      const status = String(report.status || "").toUpperCase();
-      if (status === "APPROVED") counts.approved += 1;
-      else if (status === "REJECTED") counts.rejected += 1;
-      else if (status === "SUBMITTED" || status === "PENDING_REVIEW") counts.submitted += 1;
-      else counts.draft += 1;
-    }
-    return counts;
-  }, [reports]);
+  const visibleReps = useMemo(() => visibleManagers.flatMap(m => m.field_reps || []), [visibleManagers]);
 
-  const sentimentData = dashboard?.sentiment || [];
-  const maxSentiment = Math.max(1, ...sentimentData.map((item: { count: number }) => Number(item.count || 0)));
-
-  const latestVisits = useMemo(
-    () => visits
-      .slice()
-      .sort((a: ApiVisit, b: ApiVisit) => new Date(b.visit_date).getTime() - new Date(a.visit_date).getTime())
-      .slice(0, 7),
-    [visits]
-  );
-
-  const latestAlerts = useMemo(
-    () => alerts
-      .filter((alert: ApiAlert) => String(alert.status || "").toUpperCase() !== "RESOLVED")
-      .slice()
-      .sort((a: ApiAlert, b: ApiAlert) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime())
-      .slice(0, 5),
-    [alerts]
-  );
-
-  const latestTasks = useMemo(
-    () => tasks
-      .filter((task: ApiActionItem) => ["PENDING", "IN_PROGRESS"].includes(String(task.status || "").toUpperCase()))
-      .slice()
-      .sort((a: ApiActionItem, b: ApiActionItem) => new Date(a.due_date || a.created_at || 0).getTime() - new Date(b.due_date || b.created_at || 0).getTime())
-      .slice(0, 5),
-    [tasks]
-  );
-
-  const managerRows = useMemo(() => managers.map((manager: ApiTeamUser) => {
-    const reps = fieldReps.filter((rep: ApiTeamUser) => String(rep.manager_id || "") === String(manager.id));
-    const managerRepIds = new Set(reps.map((rep: ApiTeamUser) => String(rep.id)));
-    const managerVisits7d = orgVisits7d.filter((visit: ApiVisit) => managerRepIds.has(String(visit.user_id))).length;
-    const managerReports7d = orgReports7d.filter((report: ApiReport) => managerRepIds.has(String(report.created_by || ""))).length;
-    const managerPending = tasks.filter((task: ApiActionItem) => {
-      const status = String(task.status || "").toUpperCase();
-      return managerRepIds.has(String(task.assigned_to || "")) && (status === "PENDING" || status === "IN_PROGRESS");
-    }).length;
-    return {
-      manager,
-      reps,
-      activeReps: reps.filter((rep: ApiTeamUser) => rep.is_active !== false).length,
-      visits7d: managerVisits7d,
-      reports7d: managerReports7d,
-      pending: managerPending,
-    };
-  }), [managers, fieldReps, orgVisits7d, orgReports7d, tasks]);
-
-  const signalRows = useMemo(() => fieldReps
-    .map((rep: ApiTeamUser) => ({
-      rep,
-      activity: activityByUser[String(rep.id)] || null,
-      latestVisit: visits
-        .filter((visit: ApiVisit) => String(visit.user_id) === String(rep.id))
-        .slice()
-        .sort((a: ApiVisit, b: ApiVisit) => new Date(b.visit_date).getTime() - new Date(a.visit_date).getTime())[0],
-    }))
-    .filter(row => row.activity || row.latestVisit)
-    .sort((a, b) => {
-      const ad = new Date(a.latestVisit?.visit_date || a.activity?.latest_insight?.created_at || 0).getTime();
-      const bd = new Date(b.latestVisit?.visit_date || b.activity?.latest_insight?.created_at || 0).getTime();
-      return bd - ad;
-    })
-    .slice(0, 8), [fieldReps, activityByUser, visits]);
-
-  const loadSignals = useCallback(async () => {
-    if (loadingSignalsRef.current) return;
-    if (!fieldReps.length) {
-      setLastUpdated(new Date());
-      return;
-    }
-    loadingSignalsRef.current = true;
-    setLoadingSignals(true);
+  async function loadOrganization(regionId = selectedRegionId, managerId = selectedManagerId, searchValue = appliedSearch) {
+    setLoadingOrg(true);
     try {
-      const entries = await Promise.all(
-        fieldReps.map(async (rep: ApiTeamUser) => {
-          try {
-            const response = await apiGet<{ activity?: ApiRepActivity }>(
-              `/users/${encodeURIComponent(rep.id)}/activity`
-            );
-            return response?.activity ? [String(rep.id), response.activity] as const : null;
-          } catch {
-            return null;
-          }
-        })
+      const regionQuery = await apiGet<{ status?: string; regions?: RegionRow[] }>("/org-management/regions");
+      setRegions(regionQuery.regions || []);
+
+      const params = new URLSearchParams();
+      if (regionId) params.set("region_id", regionId);
+      if (managerId) params.set("manager_id", managerId);
+      if (searchValue.trim()) params.set("search", searchValue.trim());
+
+      const tree = await apiGet<{ status?: string; managers?: TreeManager[] }>(
+        `/org-management/tree${params.toString() ? `?${params.toString()}` : ""}`
       );
-      const next: Record<string, ApiRepActivity> = {};
-      for (const entry of entries) {
-        if (entry) next[entry[0]] = entry[1];
+      setManagers(tree.managers || []);
+
+      const currentlySelected = (tree.managers || []).find(m => String(m.id) === String(managerId)) || null;
+      setSelectedManager(currentlySelected);
+      if (currentlySelected) {
+        setSelectedRep(prev => prev && currentlySelected.field_reps.some(r => String(r.id) === String(prev.id)) ? prev : null);
+      } else if (managerId) {
+        setSelectedManager(null);
+        setSelectedRep(null);
       }
-      setActivityByUser(next);
-      setLastUpdated(new Date());
-    } finally {
-      loadingSignalsRef.current = false;
-      setLoadingSignals(false);
-    }
-  }, [fieldReps]);
-
-  useEffect(() => {
-    void loadSignals();
-  }, [loadSignals]);
-
-  async function refreshAll() {
-    try {
-      await onRefresh?.();
-      await loadSignals();
-      onNotify?.("Executive intelligence refreshed.");
     } catch (e: any) {
-      onNotify?.(e?.message || "Could not refresh executive intelligence.");
+      onNotify?.(e?.message || "Could not load organization data.");
+    } finally {
+      setLoadingOrg(false);
     }
   }
 
+  useEffect(() => {
+    void loadOrganization("", "", "");
+    // Initial organization load only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function applyFilters(nextRegionId = selectedRegionId, nextManagerId = selectedManagerId) {
+    setSelectedRep(null);
+    await loadOrganization(nextRegionId, nextManagerId, appliedSearch);
+  }
+
+  function handleRegionChange(value: string) {
+    setSelectedRegionId(value);
+    setSelectedManagerId("");
+    setSelectedManager(null);
+    setSelectedRep(null);
+    void loadOrganization(value, "", appliedSearch);
+  }
+
+  function handleManagerChange(value: string) {
+    setSelectedManagerId(value);
+    setSelectedRep(null);
+    setSelectedManager(managers.find(m => String(m.id) === String(value)) || null);
+    void loadOrganization(selectedRegionId, value, appliedSearch);
+  }
+
+  function handleSearchSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setAppliedSearch(search.trim());
+    void loadOrganization(selectedRegionId, selectedManagerId, search.trim());
+  }
+
+  async function refreshOrganization() {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      await onRefresh?.();
+      await loadOrganization(selectedRegionId, selectedManagerId, appliedSearch);
+      onNotify?.("Organization intelligence refreshed.");
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  function openRep(rep: TreeRep) {
+    setSelectedRep(rep);
+  }
+
+  function clearSelection() {
+    setSelectedRegionId("");
+    setSelectedManagerId("");
+    setAppliedSearch("");
+    setSearch("");
+    setSelectedManager(null);
+    setSelectedRep(null);
+    void loadOrganization("", "", "");
+  }
+
+  async function createEmployee() {
+    if (employeeBusy) return;
+    if (!employeeForm.full_name.trim() || !employeeForm.email.trim() || !employeeForm.password.trim()) {
+      onNotify?.("Name, email and password are required.");
+      return;
+    }
+    if (employeeForm.role === "FIELD_REP" && !employeeForm.manager_id) {
+      onNotify?.("Select a Manager for the new Field Rep.");
+      return;
+    }
+    const regionIds = employeeForm.role === "MANAGER"
+      ? employeeForm.region_ids
+      : employeeForm.territory_id ? [employeeForm.territory_id] : [];
+    if (!regionIds.length) {
+      onNotify?.("Select at least one region.");
+      return;
+    }
+
+    setEmployeeBusy(true);
+    try {
+      await apiPost("/org-management/employees", {
+        full_name: employeeForm.full_name.trim(),
+        email: employeeForm.email.trim(),
+        password: employeeForm.password,
+        role: employeeForm.role,
+        phone: employeeForm.phone.trim() || null,
+        manager_id: employeeForm.role === "FIELD_REP" ? employeeForm.manager_id : null,
+        territory_id: regionIds[0] || null,
+        region_ids: regionIds,
+      });
+      onNotify?.("Employee account created successfully.");
+      setCreatingEmployee(false);
+      setEmployeeForm({ full_name: "", email: "", phone: "", role: "FIELD_REP", password: "Temp@1234", manager_id: "", territory_id: "", region_ids: [] });
+      await loadOrganization(selectedRegionId, selectedManagerId, appliedSearch);
+      await onRefresh?.();
+    } catch (e: any) {
+      onNotify?.(e?.message || "Could not create employee.");
+    } finally {
+      setEmployeeBusy(false);
+    }
+  }
+
+  async function changeRole(rep: TreeRep, role: string) {
+    try {
+      await apiPatch(`/org-management/users/${encodeURIComponent(rep.id)}/role`, { role });
+      onNotify?.(`Role updated for ${rep.full_name}.`);
+      await loadOrganization(selectedRegionId, selectedManagerId, appliedSearch);
+      await onRefresh?.();
+    } catch (e: any) {
+      onNotify?.(e?.message || "Could not update role.");
+    }
+  }
+
+  async function toggleActive(userRow: TreeRep) {
+    const next = userRow.is_active === false;
+    try {
+      await apiPatch(`/org-management/users/${encodeURIComponent(userRow.id)}/status`, { is_active: next });
+      onNotify?.(next ? `${userRow.full_name} activated.` : `${userRow.full_name} deactivated.`);
+      await loadOrganization(selectedRegionId, selectedManagerId, appliedSearch);
+      await onRefresh?.();
+    } catch (e: any) {
+      onNotify?.(e?.message || "Could not update employee status.");
+    }
+  }
+
+  const totalPeople = managers.length + new Set(managers.flatMap(m => m.field_reps.map(r => String(r.id)))).size;
+  const currentManagers = managers.filter(m => m.is_active !== false).length;
+
+  if (!isExecutive) return null;
+
   return (
-    <div className="executive-intelligence-page">
+    <div className="organization-command-page">
       <SectionHeader
-        eyebrow="EXECUTIVE INTELLIGENCE"
-        title="Organization intelligence"
-        sub="A live organization-level view of field coverage, reporting flow, AI signals, workload, and management structure."
+        eyebrow="EXECUTIVE ORGANIZATION"
+        title="Organization command center"
+        sub="Start with a region, narrow to a manager, then inspect individual Field Rep performance and activity."
         action={(
-          <button type="button" className="button ghost" onClick={() => void refreshAll()} disabled={loadingSignals}>
-            {loadingSignals ? <Spinner size={12} /> : <RefreshCw size={12} />}
-            {loadingSignals ? "Refreshing…" : "Refresh intelligence"}
-          </button>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
+            <button type="button" className="button ghost" onClick={() => void refreshOrganization()} disabled={refreshing || loadingOrg}>
+              {refreshing || loadingOrg ? <Spinner size={12} /> : <RefreshCw size={12} />}
+              {refreshing || loadingOrg ? "Refreshing…" : "Refresh"}
+            </button>
+            <button type="button" className="button primary" onClick={() => setCreatingEmployee(true)}>
+              <Plus size={13} /> Add employee
+            </button>
+          </div>
         )}
       />
 
-      <div className="executive-intelligence-kpis">
-        <div className="executive-intelligence-kpi">
-          <span>People</span>
-          <strong>{managers.length + fieldReps.length}</strong>
-          <small>{activeManagers} active managers · {activeReps} active reps · {unassignedReps} unassigned</small>
-        </div>
-        <div className="executive-intelligence-kpi">
-          <span>Visits · 7 days</span>
-          <strong>{orgVisits7d.length}</strong>
-          <small>{repsWithVisits7d} reps active in field · {customersVisited7d} customers visited</small>
-        </div>
-        <div className="executive-intelligence-kpi">
-          <span>Reports · 7 days</span>
-          <strong>{orgReports7d.length}</strong>
-          <small>{reportFlow.submitted} submitted · {reportFlow.approved} approved</small>
-        </div>
-        <div className="executive-intelligence-kpi alert">
-          <span>Attention queue</span>
-          <strong>{openAlerts + pendingTasks}</strong>
-          <small>{openAlerts} open alerts · {pendingTasks} pending follow-ups</small>
-        </div>
-      </div>
+      <section className="panel organization-filter-panel">
+        <div className="organization-filter-row">
+          <form className="organization-search" onSubmit={handleSearchSubmit}>
+            <Search size={14} />
+            <input
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              placeholder="Search manager or Field Rep…"
+              aria-label="Search manager or Field Rep"
+            />
+            {search && <button type="button" className="icon-btn" onClick={() => { setSearch(""); setAppliedSearch(""); void loadOrganization(selectedRegionId, selectedManagerId, ""); }}><X size={13} /></button>}
+            <button type="submit" className="button ghost" style={{ padding: "7px 10px" }}>Search</button>
+          </form>
 
-      <div className="executive-intelligence-signal-strip">
-        <div className="executive-intelligence-signal-copy">
-          <div className="executive-intelligence-label"><Sparkles size={13} /> ORGANIZATION SIGNALS</div>
-          <strong>Commercial signal snapshot</strong>
-          <span>{dashboard?.overview?.high_opportunities ?? 0} high opportunities · {dashboard?.overview?.high_risks ?? 0} high risks · {dashboard?.overview?.total_leads ?? leads.length} leads in the organization.</span>
-        </div>
-        <div className="executive-intelligence-signal-actions">
-          {lastUpdated && <span className="executive-intelligence-updated">Updated {fmtDateTime(lastUpdated.toISOString())}</span>}
-          <button type="button" className="text-button" onClick={() => onGo("reports")}>Open reports <ArrowUpRight size={12} /></button>
-        </div>
-      </div>
+          <label className="organization-filter-control">
+            <span>Region</span>
+            <select value={selectedRegionId} onChange={e => handleRegionChange(e.target.value)}>
+              <option value="">All regions</option>
+              {regions.map(region => <option key={region.id} value={region.id}>{region.name}</option>)}
+            </select>
+          </label>
 
-      <div className="executive-intelligence-main-grid">
-        <section className="panel">
-          <PanelTitle title="Management coverage" icon={BriefcaseBusiness} action={<button type="button" className="text-button" onClick={() => onGo("team")}>Open organization <ArrowUpRight size={12} /></button>} />
-          {managerRows.length === 0 ? (
-            <Empty text="No managers are currently available in the organization." icon={Users} />
-          ) : (
-            <div className="executive-intelligence-manager-list">
-              {managerRows.map(row => (
-                <div className="executive-intelligence-manager-row" key={row.manager.id}>
-                  <div className="executive-intelligence-manager-person">
-                    <div className="avatar">{initials(row.manager.full_name)}</div>
-                    <div>
-                      <strong>{row.manager.full_name}</strong>
-                      <span>{row.reps.length} Field Rep{row.reps.length === 1 ? "" : "s"} assigned</span>
-                    </div>
-                  </div>
-                  <div className="executive-intelligence-manager-metrics">
-                    <span><b>{row.activeReps}</b> active</span>
-                    <span><b>{row.visits7d}</b> visits</span>
-                    <span><b>{row.reports7d}</b> reports</span>
-                    <span><b>{row.pending}</b> pending</span>
-                  </div>
-                </div>
-              ))}
-            </div>
+          <label className="organization-filter-control">
+            <span>Manager</span>
+            <select value={selectedManagerId} onChange={e => handleManagerChange(e.target.value)} disabled={!managers.length}>
+              <option value="">All managers</option>
+              {managers.map(manager => <option key={manager.id} value={manager.id}>{manager.full_name}</option>)}
+            </select>
+          </label>
+
+          {(selectedRegionId || selectedManagerId || appliedSearch) && (
+            <button type="button" className="text-button" onClick={clearSelection}>Clear filters</button>
           )}
-        </section>
+        </div>
+      </section>
 
-        <section className="panel">
-          <PanelTitle title="AI signal mix" icon={Sparkles} action={<button type="button" className="text-button" onClick={() => void loadSignals()} disabled={loadingSignals}>Refresh signals <RefreshCw size={11} /></button>} />
-          <div className="executive-intelligence-signal-metrics">
-            <div><strong>{dashboard?.overview?.high_opportunities ?? 0}</strong><span>High opportunities</span></div>
-            <div><strong>{dashboard?.overview?.high_risks ?? 0}</strong><span>High risks</span></div>
-            <div><strong>{openAlerts}</strong><span>Open alerts</span></div>
-          </div>
-          <div className="executive-intelligence-sentiment">
-            {sentimentData.length === 0 ? <Empty text="No sentiment data yet." icon={Activity} /> : sentimentData.map((item: { sentiment: string | null; count: number }) => {
-              const count = Number(item.count || 0);
-              return (
-                <div className="executive-intelligence-sentiment-row" key={String(item.sentiment || "Unknown")}>
-                  <span>{item.sentiment || "Unknown"}</span>
-                  <div><i style={{ width: `${Math.max(8, (count / maxSentiment) * 100)}%` }} /></div>
-                  <strong>{count}</strong>
-                </div>
-              );
-            })}
-          </div>
-        </section>
+      <div className="organization-summary-grid">
+        <div className="metric"><div className="metric-top"><Users size={16} /><span>People in view</span></div><strong>{totalPeople}</strong><small>{currentManagers} active managers · {activeRepCount} active reps</small></div>
+        <div className="metric"><div className="metric-top"><MapPin size={16} /><span>Regions</span></div><strong>{selectedRegion ? 1 : regionById.size}</strong><small>{selectedRegion ? selectedRegion.name : "Organization regions"}</small></div>
+        <div className="metric"><div className="metric-top"><BriefcaseBusiness size={16} /><span>Visits in view</span></div><strong>{scopedVisitCount}</strong><small>{scopedCompletedVisits} completed</small></div>
+        <div className="metric"><div className="metric-top"><FileText size={16} /><span>Reports in view</span></div><strong>{scopedReportCount}</strong><small>{scopedApprovedReports} approved</small></div>
       </div>
 
-      <div className="executive-intelligence-secondary-grid">
+      {selectedRegion && (
+        <section className="panel organization-region-banner">
+          <div>
+            <span className="eyebrow">SELECTED REGION</span>
+            <h2>{selectedRegion.name}</h2>
+            <p>{selectedRegion.city || selectedRegion.state || "Region"} · {Number(selectedRegion.manager_count || 0)} managers · {Number(selectedRegion.rep_count || 0)} reps · {Number(selectedRegion.customer_count || 0)} customers</p>
+          </div>
+          <div className="organization-region-stats">
+            <span><b>{Number(selectedRegion.manager_count || 0)}</b> managers</span>
+            <span><b>{Number(selectedRegion.rep_count || 0)}</b> reps</span>
+            <span><b>{Number(selectedRegion.visit_count || 0)}</b> visits</span>
+          </div>
+        </section>
+      )}
+
+      <div className="organization-main-grid">
         <section className="panel">
-          <PanelTitle title="Field signal watch" icon={Activity} action={<button type="button" className="text-button" onClick={() => void loadSignals()} disabled={loadingSignals}>Update <RefreshCw size={11} /></button>} />
-          {signalRows.length === 0 ? (
-            <Empty text="No Field Rep activity signals are available yet." icon={Activity} />
+          <PanelTitle title={selectedRegion ? `${selectedRegion.name} — Managers` : "Managers"} icon={BriefcaseBusiness} />
+          {loadingOrg ? (
+            <div className="organization-empty"><Spinner size={24} /><strong>Loading organization…</strong><span>Fetching the latest management hierarchy.</span></div>
+          ) : visibleManagers.length === 0 ? (
+            <Empty text="No managers match the current filters." icon={Users} />
           ) : (
-            <div className="executive-intelligence-signal-list">
-              {signalRows.map(row => {
-                const activity = row.activity;
-                const risk = Number(activity?.metrics?.high_risks || 0);
-                const opportunity = Number(activity?.metrics?.high_opportunities || 0);
-                const sentiment = activity?.latest_insight?.sentiment;
+            <div className="organization-manager-list">
+              {visibleManagers.map(manager => {
+                const isSelected = String(selectedManager?.id) === String(manager.id);
+                const managerReps = manager.field_reps || [];
+                const managerRepIds = new Set(managerReps.map(rep => String(rep.id)));
+                const managerVisits = visits.filter(v => managerRepIds.has(String(v.user_id))).length;
+                const managerReports = reports.filter(r => managerRepIds.has(String(r.created_by || ""))).length;
+                const managerCompleted = visits.filter(v => managerRepIds.has(String(v.user_id)) && String(v.status || "").toUpperCase() === "COMPLETED").length;
                 return (
-                  <div className="executive-intelligence-signal-item" key={row.rep.id}>
-                    <div className="avatar">{initials(row.rep.full_name)}</div>
-                    <div className="executive-intelligence-signal-body">
-                      <strong>{row.rep.full_name}</strong>
-                      <span>{activity?.latest_insight?.summary || (row.latestVisit ? `Latest visit: ${row.latestVisit.customer_name} · ${fmtDateTime(row.latestVisit.visit_date)}` : "No recent signal summary")}</span>
+                  <button
+                    type="button"
+                    key={manager.id}
+                    className={`organization-manager-card ${isSelected ? "selected" : ""}`}
+                    onClick={() => {
+                      setSelectedManagerId(String(manager.id));
+                      setSelectedManager(manager);
+                      setSelectedRep(null);
+                    }}
+                  >
+                    <div className="organization-person-main">
+                      <div className="avatar large">{initials(manager.full_name)}</div>
+                      <div>
+                        <strong>{manager.full_name}</strong>
+                        <span>{manager.regions.length ? manager.regions.map(r => r.territory_name).join(" · ") : "No region assigned"}</span>
+                      </div>
                     </div>
-                    <div className="executive-intelligence-signal-tags">
-                      {sentiment && <Badge label={String(sentiment)} type="pending" />}
-                      <Badge label={`${opportunity} opp`} type="success" />
-                      <Badge label={`${risk} risk`} type={risk > 0 ? "error" : "success"} />
+                    <div className="organization-manager-metrics">
+                      <span><b>{managerReps.length}</b> reps</span>
+                      <span><b>{managerVisits}</b> visits</span>
+                      <span><b>{managerReports}</b> reports</span>
+                      <span><b>{managerCompleted}</b> completed</span>
                     </div>
-                  </div>
+                    <ChevronRight size={16} />
+                  </button>
                 );
               })}
             </div>
@@ -4591,60 +4646,127 @@ function ExecutiveOrganizationIntelligenceView({
         </section>
 
         <section className="panel">
-          <PanelTitle title="Reporting flow" icon={FileText} action={<button type="button" className="text-button" onClick={() => onGo("reports")}>Review reports <ArrowUpRight size={12} /></button>} />
-          <div className="executive-intelligence-flow-grid">
-            <div><strong>{reportFlow.draft}</strong><span>Draft / other</span></div>
-            <div><strong>{reportFlow.submitted}</strong><span>Submitted</span></div>
-            <div><strong>{reportFlow.approved}</strong><span>Approved</span></div>
-            <div><strong>{reportFlow.rejected}</strong><span>Rejected</span></div>
-          </div>
-          <div className="executive-intelligence-flow-note">
-            <CheckCircle2 size={14} />
-            <span>Report status is shown from the current organization-wide report data.</span>
-          </div>
-        </section>
-      </div>
-
-      <div className="executive-intelligence-bottom-grid">
-        <section className="panel">
-          <PanelTitle title="Recent field activity" icon={MapPin} action={<button type="button" className="text-button" onClick={() => onGo("team")}>Organization <ArrowUpRight size={12} /></button>} />
-          {latestVisits.length === 0 ? <Empty text="No organization visits yet." icon={MapPin} /> : (
-            <div className="activity-list">
-              {latestVisits.map((visit: ApiVisit) => (
-                <div className="activity-item" key={visit.id}>
-                  <div className={`activity-dot ${String(visit.status || "").toLowerCase()}`} />
-                  <div className="activity-body"><strong>{visit.customer_name}</strong><span>{visit.user_name} · {fmtDateTime(visit.visit_date)}</span></div>
-                  <Badge label={String(visit.status || "UNKNOWN").replace(/_/g, " ")} type={String(visit.status).toUpperCase() === "COMPLETED" ? "success" : "pending"} />
-                </div>
-              ))}
-            </div>
-          )}
-        </section>
-
-        <section className="panel">
-          <PanelTitle title="Attention queue" icon={AlertTriangle} action={<button type="button" className="text-button" onClick={() => onGo("tasks")}>Open action items <ArrowUpRight size={12} /></button>} />
-          {latestAlerts.length === 0 && latestTasks.length === 0 ? (
-            <Empty text="No open alerts or pending follow-ups." icon={CheckCircle2} />
+          <PanelTitle title={selectedManager ? selectedManager.full_name : "Field representatives"} icon={Users} action={selectedManager ? <StatusChip label={`${selectedManager.regions.length} regions`} ok /> : undefined} />
+          {!selectedManager ? (
+            <Empty text="Select a Manager to view their Field Reps." icon={Users} />
           ) : (
-            <div className="executive-intelligence-queue">
-              {latestAlerts.map((alert: ApiAlert) => (
-                <div className="executive-intelligence-queue-item" key={`alert-${alert.id}`}>
-                  <AlertTriangle size={13} />
-                  <div><strong>{alert.title}</strong><span>{alert.customer_name || "Organization alert"} · {fmtDateTime(alert.created_at)}</span></div>
-                  <Badge label={String(alert.severity || "OPEN")} type="error" />
-                </div>
-              ))}
-              {latestTasks.map((task: ApiActionItem) => (
-                <div className="executive-intelligence-queue-item" key={`task-${task.id}`}>
-                  <ClipboardCheck size={13} />
-                  <div><strong>{task.title}</strong><span>{task.customer_name || "Follow-up"}{task.due_date ? ` · Due ${fmtDate(task.due_date)}` : ""}</span></div>
-                  <Badge label={String(task.priority || "PENDING")} type="pending" />
-                </div>
-              ))}
+            <div className="organization-rep-list">
+              {visibleReps.length === 0 ? <Empty text="No Field Reps are assigned to this Manager in the current scope." icon={Users} /> : visibleReps.map(rep => {
+                const selected = String(selectedRep?.id) === String(rep.id);
+                return (
+                  <div key={rep.id} className={`organization-rep-card ${selected ? "selected" : ""}`}>
+                    <button type="button" className="organization-rep-select" onClick={() => openRep(rep)}>
+                      <div className="avatar">{initials(rep.full_name)}</div>
+                      <div className="organization-rep-copy">
+                        <strong>{rep.full_name}</strong>
+                        <span>{rep.territory_name || "No region"} · {rep.is_active === false ? "Inactive" : "Active"}</span>
+                      </div>
+                      <div className="organization-rep-counts"><b>{rep.visit_count || 0}</b><span>visits</span><b>{rep.report_count || 0}</b><span>reports</span></div>
+                      <ChevronRight size={15} />
+                    </button>
+                    <div className="organization-rep-actions">
+                      <button type="button" className="text-button" onClick={() => onOpenRepActivity?.(rep)}>Performance & activity</button>
+                      <select value={String(rep.role || "FIELD_REP").toUpperCase()} onChange={e => void changeRole(rep, e.target.value)}>
+                        <option value="FIELD_REP">Field Rep</option>
+                        <option value="MANAGER">Manager</option>
+                      </select>
+                      <button type="button" className="text-button" onClick={() => void toggleActive(rep)}>{rep.is_active === false ? "Activate" : "Deactivate"}</button>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
         </section>
       </div>
+
+      {selectedManager && (
+        <section className="panel organization-performance-panel">
+          <PanelTitle title="Manager performance" icon={Gauge} />
+          <div className="organization-performance-grid">
+            <div><strong>{selectedManager.field_reps.length}</strong><span>Team members</span></div>
+            <div><strong>{selectedManager.regions.length}</strong><span>Regions managed</span></div>
+            <div><strong>{visits.filter(v => selectedManager.field_reps.some(r => String(r.id) === String(v.user_id))).length}</strong><span>Total visits</span></div>
+            <div><strong>{reports.filter(r => selectedManager.field_reps.some(rep => String(rep.id) === String(r.created_by || ""))).length}</strong><span>Total reports</span></div>
+            <div><strong>{visits.filter(v => selectedManager.field_reps.some(r => String(r.id) === String(v.user_id)) && String(v.status || "").toUpperCase() === "COMPLETED").length}</strong><span>Completed visits</span></div>
+            <div><strong>{reports.filter(r => selectedManager.field_reps.some(rep => String(rep.id) === String(r.created_by || "")) && String(r.status || "").toUpperCase() === "APPROVED").length}</strong><span>Approved reports</span></div>
+          </div>
+        </section>
+      )}
+
+      {selectedRep && (
+        <section className="panel organization-selected-rep-panel">
+          <div className="organization-selected-rep-head">
+            <div className="organization-person-main">
+              <div className="avatar huge">{initials(selectedRep.full_name)}</div>
+              <div><span className="eyebrow">SELECTED FIELD REP</span><h2>{selectedRep.full_name}</h2><p>{selectedRep.territory_name || "No region"} · {selectedRep.manager_name || selectedManager?.full_name || "No manager"}</p></div>
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button type="button" className="button primary" onClick={() => onOpenRepActivity ?.(selectedRep)}><BarChart3 size={13} /> Open performance</button>
+              <button type="button" className="button ghost" onClick={() => setSelectedRep(null)}>Close</button>
+            </div>
+          </div>
+          <div className="organization-rep-preview-grid">
+            <div><strong>{selectedRep.visit_count || 0}</strong><span>Visits</span></div>
+            <div><strong>{selectedRep.report_count || 0}</strong><span>Reports</span></div>
+            <div><strong>{selectedRep.is_active === false ? "Inactive" : "Active"}</strong><span>Status</span></div>
+            <div><strong>{selectedRep.territory_name || "—"}</strong><span>Region</span></div>
+          </div>
+        </section>
+      )}
+
+      <div className="organization-lower-grid">
+        <section className="panel">
+          <PanelTitle title="Region directory" icon={MapPin} />
+          <div className="organization-region-list">
+            {regions.map(region => (
+              <button type="button" key={region.id} className={`organization-region-card ${selectedRegionId === String(region.id) ? "selected" : ""}`} onClick={() => handleRegionChange(String(region.id))}>
+                <div><strong>{region.name}</strong><span>{region.city || region.state || "Region"}</span></div>
+                <div><b>{Number(region.manager_count || 0)}</b><span>managers</span><b>{Number(region.rep_count || 0)}</b><span>reps</span></div>
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="panel">
+          <PanelTitle title="Current scope" icon={ShieldCheck} />
+          <div className="organization-scope-note">
+            <strong>Executive access</strong>
+            <span>Organization-wide. Use Region → Manager → Field Rep to narrow the view. Rep activity opens the existing server-authorized performance workspace.</span>
+          </div>
+          <div className="organization-scope-note">
+            <strong>Management actions</strong>
+            <span>Executive can create employees, change Field Rep/Manager role, and activate or deactivate employee accounts.</span>
+          </div>
+        </section>
+      </div>
+
+      {creatingEmployee && (
+        <div className="modal-backdrop" onClick={e => { if (e.target === e.currentTarget) setCreatingEmployee(false); }}>
+          <div className="organization-employee-modal">
+            <div className="organization-modal-head">
+              <div><span className="eyebrow">EMPLOYEE MANAGEMENT</span><h2>Add employee</h2><p>Create a prototype account and assign its organizational scope.</p></div>
+              <button type="button" className="icon-btn" onClick={() => setCreatingEmployee(false)}><X size={15} /></button>
+            </div>
+            <div className="organization-form-grid">
+              <label><span>Full name</span><input value={employeeForm.full_name} onChange={e => setEmployeeForm(f => ({ ...f, full_name: e.target.value }))} /></label>
+              <label><span>Email</span><input type="email" value={employeeForm.email} onChange={e => setEmployeeForm(f => ({ ...f, email: e.target.value }))} /></label>
+              <label><span>Phone</span><input value={employeeForm.phone} onChange={e => setEmployeeForm(f => ({ ...f, phone: e.target.value }))} /></label>
+              <label><span>Role</span><select value={employeeForm.role} onChange={e => setEmployeeForm(f => ({ ...f, role: e.target.value, manager_id: "", territory_id: "", region_ids: [] }))}><option value="FIELD_REP">Field Rep</option><option value="MANAGER">Manager</option></select></label>
+              <label><span>Temporary password</span><input value={employeeForm.password} onChange={e => setEmployeeForm(f => ({ ...f, password: e.target.value }))} /></label>
+              {employeeForm.role === "FIELD_REP" && (
+                <label><span>Manager</span><select value={employeeForm.manager_id} onChange={e => setEmployeeForm(f => ({ ...f, manager_id: e.target.value }))}><option value="">Select Manager</option>{teamUsers.filter(u => String(u.role).toUpperCase() === "MANAGER" && u.is_active !== false).map(m => <option key={m.id} value={m.id}>{m.full_name}</option>)}</select></label>
+              )}
+              {employeeForm.role === "FIELD_REP" ? (
+                <label><span>Region</span><select value={employeeForm.territory_id} onChange={e => setEmployeeForm(f => ({ ...f, territory_id: e.target.value }))}><option value="">Select Region</option>{regions.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}</select></label>
+              ) : (
+                <div className="organization-region-checkboxes"><span>Regions managed</span>{regions.map(r => <label key={r.id}><input type="checkbox" checked={employeeForm.region_ids.includes(String(r.id))} onChange={e => setEmployeeForm(f => ({ ...f, region_ids: e.target.checked ? [...f.region_ids, String(r.id)] : f.region_ids.filter(id => id !== String(r.id)) }))} />{r.name}</label>)}</div>
+              )}
+            </div>
+            <div className="organization-modal-actions"><button type="button" className="button ghost" onClick={() => setCreatingEmployee(false)}>Cancel</button><button type="button" className="button primary" onClick={() => void createEmployee()} disabled={employeeBusy}>{employeeBusy ? <Spinner size={12} /> : <Plus size={13} />}{employeeBusy ? "Creating…" : "Create employee"}</button></div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -4656,7 +4778,7 @@ function ExecutiveViews({ view, dashboard, alerts, leads, customers, visits, rep
   if (view === "home") return <ExecutiveHome dashboard={dashboard} leads={leads} onGo={onGo} />;
   if (view === "reports") return <ReportsListView reports={reports} user={user} onRefresh={onRefresh} onNotify={onNotify} onGo={onGo} />;
   if (view === "tasks") return <TasksView tasks={tasks} onUpdateTask={onUpdateTask} />;
-  if (view === "insights") return (
+  if (view === "organization") return (
     <ExecutiveOrganizationIntelligenceView
       dashboard={dashboard}
       alerts={alerts}
@@ -4666,10 +4788,12 @@ function ExecutiveViews({ view, dashboard, alerts, leads, customers, visits, rep
       tasks={tasks}
       teamUsers={teamUsers}
       onGo={onGo}
+      onOpenRepActivity={onOpenRepActivity}
       onRefresh={onRefresh}
       onNotify={onNotify}
     />
   );
+  if (view === "insights") return <InsightsView dashboard={dashboard} alerts={alerts} />;
   if (view === "map") return <TerritoryView customers={customers} />;
   if (view === "team") return (
     <TeamView

@@ -17,6 +17,7 @@ from app.api.reports import router as reports_router
 from app.api.leads import router as leads_router   
 from app.api.dashboard import router as dashboard_router
 from app.api.executive_intelligence import router as executive_intelligence_router
+from app.api.organization_management import router as organization_management_router
 
 
 
@@ -70,6 +71,7 @@ app.include_router(leads_router)
 #Dashboard API
 app.include_router(dashboard_router)
 app.include_router(executive_intelligence_router)
+app.include_router(organization_management_router)
 
 
 # Static files for upload Voice notes 
