@@ -30,6 +30,7 @@ def create_visit(
 ):
     organization_id = current_user["organization_id"]
     user_id = current_user["id"]
+    role = str(current_user.get("role") or "").strip().upper()
 
     # Verify customer belongs to the same organization
     customer = db.execute(
@@ -77,6 +78,40 @@ def create_visit(
     # If no territory was supplied, use customer's territory
     final_territory_id = territory_id or customer["territory_id"]
 
+    # Managers may create personal visits only inside regions assigned to them.
+    if role == "MANAGER":
+        if not final_territory_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Your visit must belong to one of your assigned regions.",
+            )
+        managed_region = db.execute(
+            text("""
+                SELECT 1
+                FROM manager_region_assignments
+                WHERE organization_id = :organization_id
+                  AND manager_id = :manager_id
+                  AND territory_id = :territory_id
+                  AND is_active = true
+                LIMIT 1
+            """),
+            {
+                "organization_id": organization_id,
+                "manager_id": user_id,
+                "territory_id": final_territory_id,
+            },
+        ).first()
+        if not managed_region:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You can only create visits inside your assigned regions.",
+            )
+
+    initial_approval_status = (
+        "PENDING" if role == "MANAGER" and str(status_value).strip().upper() == "COMPLETED"
+        else "NOT_REQUIRED"
+    )
+
     result = db.execute(
         text("""
             INSERT INTO visits (
@@ -90,7 +125,8 @@ def create_visit(
                 location_accuracy_m,
                 visit_type,
                 status,
-                notes
+                notes,
+                approval_status
             )
             VALUES (
                 :organization_id,
@@ -103,7 +139,8 @@ def create_visit(
                 :location_accuracy_m,
                 :visit_type,
                 :status,
-                :notes
+                :notes,
+                :approval_status
             )
             RETURNING
                 id,
@@ -118,6 +155,12 @@ def create_visit(
                 visit_type,
                 status,
                 notes,
+                approval_status,
+                approved_by,
+                approved_at,
+                rejected_by,
+                rejected_at,
+                rejection_reason,
                 created_at,
                 updated_at
         """),
@@ -133,6 +176,7 @@ def create_visit(
             "visit_type": visit_type,
             "status": status_value,
             "notes": notes,
+            "approval_status": initial_approval_status,
         },
     )
 
@@ -154,6 +198,7 @@ def get_visits(
     date_from: str | None = None,
     date_to: str | None = None,
     search: str | None = None,
+    approval_status: str | None = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -225,6 +270,14 @@ def get_visits(
         filters.append("UPPER(v.status) = :status_value")
         params["status_value"] = normalized
 
+    if approval_status:
+        allowed_approval_statuses = {"NOT_REQUIRED", "PENDING", "APPROVED", "REJECTED"}
+        normalized_approval = approval_status.strip().upper()
+        if normalized_approval not in allowed_approval_statuses:
+            raise HTTPException(status_code=400, detail="Invalid visit approval status filter.")
+        filters.append("UPPER(v.approval_status) = :approval_status")
+        params["approval_status"] = normalized_approval
+
     def normalize_date(value: str | None, name: str) -> str | None:
         if not value:
             return None
@@ -261,6 +314,7 @@ def get_visits(
                 rep.full_name AS user_name,
                 rep.manager_id,
                 manager.full_name AS manager_name,
+                rep.role AS user_role,
                 v.visit_date,
                 v.latitude,
                 v.longitude,
@@ -268,6 +322,14 @@ def get_visits(
                 v.visit_type,
                 v.status,
                 v.notes,
+                v.approval_status,
+                v.approved_by,
+                v.approved_at,
+                approved_user.full_name AS approved_by_name,
+                v.rejected_by,
+                v.rejected_at,
+                rejected_user.full_name AS rejected_by_name,
+                v.rejection_reason,
                 v.created_at,
                 v.updated_at
             FROM visits v
@@ -278,6 +340,12 @@ def get_visits(
             LEFT JOIN users manager
               ON manager.id = rep.manager_id
              AND manager.organization_id = rep.organization_id
+            LEFT JOIN users approved_user
+              ON approved_user.id = v.approved_by
+             AND approved_user.organization_id = v.organization_id
+            LEFT JOIN users rejected_user
+              ON rejected_user.id = v.rejected_by
+             AND rejected_user.organization_id = v.organization_id
             LEFT JOIN territories t
               ON t.id = v.territory_id
              AND t.organization_id = v.organization_id
@@ -297,6 +365,7 @@ def get_visits(
             "manager_id": manager_id,
             "user_id": user_id,
             "status": status_value.upper() if status_value else None,
+            "approval_status": approval_status.upper() if approval_status else None,
             "date_from": date_from,
             "date_to": date_to,
             "search": search,
@@ -344,7 +413,11 @@ def update_visit(
                 v.organization_id,
                 v.user_id,
                 v.status,
-                v.notes
+                v.notes,
+                v.approval_status,
+                v.rejected_by,
+                v.rejected_at,
+                v.rejection_reason
             FROM visits v
             WHERE v.id = :visit_id
               AND v.organization_id = :organization_id
@@ -410,12 +483,42 @@ def update_visit(
 
     next_notes = payload.notes if payload.notes is not None else visit["notes"]
 
+    # A Manager's own completed visit enters Executive approval. Team visits
+    # and all Field Rep visits retain their normal visit lifecycle.
+    is_own_manager_visit = role == "MANAGER" and visit_user_id == user_id
+    approval_update = {}
+    if is_own_manager_visit:
+        if next_status == "COMPLETED":
+            approval_update = {
+                "approval_status": "PENDING",
+                "approved_by": None,
+                "approved_at": None,
+                "rejected_by": None,
+                "rejected_at": None,
+                "rejection_reason": None,
+            }
+        elif next_status in {"IN_PROGRESS", "CANCELLED"}:
+            approval_update = {
+                "approval_status": "NOT_REQUIRED",
+                "approved_by": None,
+                "approved_at": None,
+                "rejected_by": None,
+                "rejected_at": None,
+                "rejection_reason": None,
+            }
+
     result = db.execute(
         text("""
             UPDATE visits
             SET
                 status = :status,
                 notes = :notes,
+                approval_status = COALESCE(:approval_status, approval_status),
+                approved_by = CASE WHEN :approval_status IS NOT NULL THEN :approved_by ELSE approved_by END,
+                approved_at = CASE WHEN :approval_status IS NOT NULL THEN :approved_at ELSE approved_at END,
+                rejected_by = CASE WHEN :approval_status IS NOT NULL THEN :rejected_by ELSE rejected_by END,
+                rejected_at = CASE WHEN :approval_status IS NOT NULL THEN :rejected_at ELSE rejected_at END,
+                rejection_reason = CASE WHEN :approval_status IS NOT NULL THEN :rejection_reason ELSE rejection_reason END,
                 updated_at = now()
             WHERE id = :visit_id
               AND organization_id = :organization_id
@@ -423,6 +526,12 @@ def update_visit(
         {
             "status": next_status,
             "notes": next_notes,
+            "approval_status": approval_update.get("approval_status"),
+            "approved_by": approval_update.get("approved_by"),
+            "approved_at": approval_update.get("approved_at"),
+            "rejected_by": approval_update.get("rejected_by"),
+            "rejected_at": approval_update.get("rejected_at"),
+            "rejection_reason": approval_update.get("rejection_reason"),
             "visit_id": visit_id,
             "organization_id": organization_id,
         },
@@ -447,6 +556,7 @@ def update_visit(
                 v.territory_id,
                 v.user_id,
                 u.full_name AS user_name,
+                u.role AS user_role,
                 v.visit_date,
                 v.latitude,
                 v.longitude,
@@ -454,6 +564,14 @@ def update_visit(
                 v.visit_type,
                 v.status,
                 v.notes,
+                v.approval_status,
+                v.approved_by,
+                v.approved_at,
+                approved_user.full_name AS approved_by_name,
+                v.rejected_by,
+                v.rejected_at,
+                rejected_user.full_name AS rejected_by_name,
+                v.rejection_reason,
                 v.created_at,
                 v.updated_at
             FROM visits v
@@ -461,6 +579,12 @@ def update_visit(
                 ON c.id = v.customer_id
             JOIN users u
                 ON u.id = v.user_id
+            LEFT JOIN users approved_user
+                ON approved_user.id = v.approved_by
+               AND approved_user.organization_id = v.organization_id
+            LEFT JOIN users rejected_user
+                ON rejected_user.id = v.rejected_by
+               AND rejected_user.organization_id = v.organization_id
             WHERE v.id = :visit_id
               AND v.organization_id = :organization_id
             LIMIT 1
@@ -496,6 +620,7 @@ def get_visit(
                 v.territory_id,
                 v.user_id,
                 u.full_name AS user_name,
+                u.role AS user_role,
                 v.visit_date,
                 v.latitude,
                 v.longitude,
@@ -503,6 +628,14 @@ def get_visit(
                 v.visit_type,
                 v.status,
                 v.notes,
+                v.approval_status,
+                v.approved_by,
+                v.approved_at,
+                approved_user.full_name AS approved_by_name,
+                v.rejected_by,
+                v.rejected_at,
+                rejected_user.full_name AS rejected_by_name,
+                v.rejection_reason,
                 v.created_at,
                 v.updated_at
             FROM visits v
@@ -510,6 +643,12 @@ def get_visit(
                 ON c.id = v.customer_id
             JOIN users u
                 ON u.id = v.user_id
+            LEFT JOIN users approved_user
+                ON approved_user.id = v.approved_by
+               AND approved_user.organization_id = v.organization_id
+            LEFT JOIN users rejected_user
+                ON rejected_user.id = v.rejected_by
+               AND rejected_user.organization_id = v.organization_id
             WHERE v.id = :visit_id
               AND v.organization_id = :organization_id
             LIMIT 1
@@ -532,3 +671,180 @@ def get_visit(
         "status": "success",
         "visit": dict(visit),
     }
+
+# =========================================================
+# EXECUTIVE APPROVAL OF MANAGER VISITS
+# =========================================================
+
+class VisitRejectRequest(BaseModel):
+    rejection_reason: str
+
+
+def _get_visit_for_approval(visit_id: str, db: Session, current_user: dict):
+    result = db.execute(
+        text("""
+            SELECT
+                v.id,
+                v.organization_id,
+                v.user_id,
+                u.role AS user_role,
+                v.status,
+                v.approval_status
+            FROM visits v
+            JOIN users u
+              ON u.id = v.user_id
+             AND u.organization_id = v.organization_id
+            WHERE v.id = :visit_id
+              AND v.organization_id = :organization_id
+            LIMIT 1
+        """),
+        {
+            "visit_id": visit_id,
+            "organization_id": current_user["organization_id"],
+        },
+    )
+    return result.mappings().first()
+
+
+@router.post("/{visit_id}/approve")
+def approve_manager_visit(
+    visit_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_role("EXECUTIVE")),
+):
+    visit = _get_visit_for_approval(visit_id, db, current_user)
+
+    if not visit:
+        raise HTTPException(status_code=404, detail="Visit not found.")
+
+    if str(visit["user_role"] or "").upper() != "MANAGER":
+        raise HTTPException(status_code=400, detail="Only Manager visits require Executive approval.")
+
+    if str(visit["approval_status"] or "").upper() != "PENDING":
+        raise HTTPException(status_code=400, detail="Only pending Manager visits can be approved.")
+
+    result = db.execute(
+        text("""
+            UPDATE visits
+            SET
+                approval_status = 'APPROVED',
+                approved_by = :approved_by,
+                approved_at = now(),
+                rejected_by = NULL,
+                rejected_at = NULL,
+                rejection_reason = NULL,
+                updated_at = now()
+            WHERE id = :visit_id
+              AND organization_id = :organization_id
+              AND approval_status = 'PENDING'
+        """),
+        {
+            "approved_by": current_user["id"],
+            "visit_id": visit_id,
+            "organization_id": current_user["organization_id"],
+        },
+    )
+
+    if result.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="The visit changed before approval. Refresh and try again.")
+
+    db.commit()
+    return {"status": "success", "message": "Manager visit approved successfully."}
+
+
+@router.post("/{visit_id}/reject")
+def reject_manager_visit(
+    visit_id: str,
+    payload: VisitRejectRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_role("EXECUTIVE")),
+):
+    reason = payload.rejection_reason.strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="A rejection reason is required.")
+    if len(reason) > 2000:
+        raise HTTPException(status_code=400, detail="Rejection reason cannot exceed 2000 characters.")
+
+    visit = _get_visit_for_approval(visit_id, db, current_user)
+    if not visit:
+        raise HTTPException(status_code=404, detail="Visit not found.")
+
+    if str(visit["user_role"] or "").upper() != "MANAGER":
+        raise HTTPException(status_code=400, detail="Only Manager visits require Executive approval.")
+
+    if str(visit["approval_status"] or "").upper() != "PENDING":
+        raise HTTPException(status_code=400, detail="Only pending Manager visits can be rejected.")
+
+    result = db.execute(
+        text("""
+            UPDATE visits
+            SET
+                approval_status = 'REJECTED',
+                rejected_by = :rejected_by,
+                rejected_at = now(),
+                rejection_reason = :rejection_reason,
+                approved_by = NULL,
+                approved_at = NULL,
+                updated_at = now()
+            WHERE id = :visit_id
+              AND organization_id = :organization_id
+              AND approval_status = 'PENDING'
+        """),
+        {
+            "rejected_by": current_user["id"],
+            "rejection_reason": reason,
+            "visit_id": visit_id,
+            "organization_id": current_user["organization_id"],
+        },
+    )
+
+    if result.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="The visit changed before rejection. Refresh and try again.")
+
+    db.commit()
+    return {"status": "success", "message": "Manager visit rejected."}
+
+
+@router.post("/{visit_id}/resubmit")
+def resubmit_manager_visit(
+    visit_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_role("MANAGER")),
+):
+    visit = _get_visit_for_approval(visit_id, db, current_user)
+    if not visit:
+        raise HTTPException(status_code=404, detail="Visit not found.")
+
+    if str(visit["user_id"]) != str(current_user["id"]):
+        raise HTTPException(status_code=403, detail="You can only resubmit your own visits.")
+    if str(visit["user_role"] or "").upper() != "MANAGER":
+        raise HTTPException(status_code=400, detail="Only Manager visits can be resubmitted.")
+    if str(visit["approval_status"] or "").upper() != "REJECTED":
+        raise HTTPException(status_code=400, detail="Only rejected Manager visits can be resubmitted.")
+
+    db.execute(
+        text("""
+            UPDATE visits
+            SET
+                approval_status = 'PENDING',
+                approved_by = NULL,
+                approved_at = NULL,
+                rejected_by = NULL,
+                rejected_at = NULL,
+                rejection_reason = NULL,
+                updated_at = now()
+            WHERE id = :visit_id
+              AND organization_id = :organization_id
+              AND user_id = :user_id
+              AND approval_status = 'REJECTED'
+        """),
+        {
+            "visit_id": visit_id,
+            "organization_id": current_user["organization_id"],
+            "user_id": current_user["id"],
+        },
+    )
+    db.commit()
+    return {"status": "success", "message": "Manager visit resubmitted for Executive approval."}

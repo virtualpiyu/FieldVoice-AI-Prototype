@@ -137,15 +137,17 @@ def require_manager(current_user: dict) -> None:
         )
 
 
-def require_field_rep(current_user: dict) -> None:
-    """Editing/resubmission is intentionally Field-Rep-only."""
+def require_report_creator(current_user: dict) -> str:
+    """Editing/submission is allowed for Field Reps and Managers on their own reports."""
     role = normalized_role(current_user)
 
-    if role not in {"FIELD_REP", "SALESPERSON"}:
+    if role not in {"FIELD_REP", "SALESPERSON", "MANAGER"}:
         raise HTTPException(
             status_code=403,
-            detail="Only FIELD_REP users can edit or resubmit reports.",
+            detail="Only FIELD_REP or MANAGER users can edit or submit reports.",
         )
+
+    return role
 
 
 # =========================================================
@@ -190,9 +192,10 @@ def create_report_draft(
             detail="Visit not found in your organization.",
         )
 
-    # FIELD_REP / SALESPERSON can create reports only for their own visits.
+    # Field Reps and Managers can create reports only for their own visits.
+    # Managers may view team reports, but their voice/report workflow is personal.
     if (
-        role in {"FIELD_REP", "SALESPERSON"}
+        role in {"FIELD_REP", "SALESPERSON", "MANAGER"}
         and str(visit["user_id"]) != str(user_id)
     ):
         raise HTTPException(
@@ -615,7 +618,7 @@ def edit_report(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    require_field_rep(current_user)
+    require_report_creator(current_user)
 
     report = get_report_access(
         report_id,
@@ -629,6 +632,12 @@ def edit_report(
             detail="Report not found or access denied.",
         )
 
+    if str(report["created_by"]) != str(current_user["id"]):
+        raise HTTPException(
+            status_code=403,
+            detail="You can only edit reports created by your own account.",
+        )
+
     if not payload.edited_report.strip():
         raise HTTPException(
             status_code=400,
@@ -637,7 +646,7 @@ def edit_report(
 
     current_status = str(report["status"] or "").upper()
 
-    # A Field Rep may edit only their own DRAFT / EDITED / REJECTED report.
+    # A Field Rep or Manager may edit only their own DRAFT / EDITED / REJECTED report.
     if current_status not in {"DRAFT", "EDITED", "REJECTED"}:
         raise HTTPException(
             status_code=400,
@@ -703,7 +712,7 @@ def submit_report(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    require_field_rep(current_user)
+    role = require_report_creator(current_user)
 
     report = get_report_access(
         report_id,
@@ -717,12 +726,15 @@ def submit_report(
             detail="Report not found or access denied.",
         )
 
+    if str(report["created_by"]) != str(current_user["id"]):
+        raise HTTPException(
+            status_code=403,
+            detail="You can only submit reports created by your own account.",
+        )
+
     current_status = str(report["status"] or "").upper()
 
-    if current_status not in {
-        "DRAFT",
-        "EDITED",
-    }:
+    if current_status not in {"DRAFT", "EDITED"}:
         raise HTTPException(
             status_code=400,
             detail="Only DRAFT or EDITED reports can be submitted.",
@@ -776,19 +788,29 @@ def submit_report(
             detail="The report changed before it could be submitted. Please refresh and try again.",
         )
 
-    # A successful Field Rep report submission completes the associated visit
-    # in the same transaction as the report status change.
+    # Completing a Manager's own visit sends that visit into Executive approval.
+    # Field Rep visits keep their existing NOT_REQUIRED approval state.
     visit_update = db.execute(
         text("""
             UPDATE visits
             SET
                 status = 'COMPLETED',
+                approval_status = CASE
+                    WHEN :creator_role = 'MANAGER' THEN 'PENDING'
+                    ELSE COALESCE(approval_status, 'NOT_REQUIRED')
+                END,
+                approved_by = CASE WHEN :creator_role = 'MANAGER' THEN NULL ELSE approved_by END,
+                approved_at = CASE WHEN :creator_role = 'MANAGER' THEN NULL ELSE approved_at END,
+                rejected_by = CASE WHEN :creator_role = 'MANAGER' THEN NULL ELSE rejected_by END,
+                rejected_at = CASE WHEN :creator_role = 'MANAGER' THEN NULL ELSE rejected_at END,
+                rejection_reason = CASE WHEN :creator_role = 'MANAGER' THEN NULL ELSE rejection_reason END,
                 updated_at = now()
             WHERE id = :visit_id
               AND organization_id = :organization_id
               AND user_id = :created_by
         """),
         {
+            "creator_role": role,
             "visit_id": report_visit_id,
             "organization_id": current_user["organization_id"],
             "created_by": current_user["id"],

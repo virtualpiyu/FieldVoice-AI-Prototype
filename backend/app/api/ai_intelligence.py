@@ -443,6 +443,31 @@ def update_alert_status(
             },
         ).mappings().first()
 
+    elif role == "MANAGER":
+        alert = db.execute(
+            text("""
+                SELECT a.id
+                FROM alerts a
+                LEFT JOIN visits v
+                  ON v.id = a.visit_id
+                 AND v.organization_id = a.organization_id
+                LEFT JOIN users rep
+                  ON rep.id = v.user_id
+                 AND rep.organization_id = a.organization_id
+                WHERE a.id = :alert_id
+                  AND a.organization_id = :organization_id
+                  AND (
+                    v.user_id = :user_id
+                    OR rep.manager_id = :user_id
+                  )
+                LIMIT 1
+            """),
+            {
+                "alert_id": alert_id,
+                "organization_id": organization_id,
+                "user_id": user_id,
+            },
+        ).mappings().first()
     else:
         alert = db.execute(
             text("""
@@ -537,12 +562,15 @@ def update_alert_status(
 def get_alerts(
     visit_id: str | None = None,
     status: str | None = None,
+    territory_id: str | None = None,
+    manager_id: str | None = None,
+    field_rep_id: str | None = None,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    organization_id = current_user["organization_id"]
-    user_id = current_user["id"]
-    role = current_user["role"]
+    organization_id = str(current_user["organization_id"])
+    user_id = str(current_user["id"])
+    role = str(current_user["role"] or "").upper()
 
     query = """
         SELECT
@@ -561,54 +589,66 @@ def get_alerts(
             a.resolved_at,
             a.created_at,
             a.updated_at,
-            c.name AS customer_name
+            c.name AS customer_name,
+            v.territory_id,
+            t.name AS region_name,
+            v.user_id AS rep_id,
+            rep.full_name AS rep_name,
+            rep.manager_id,
+            manager.full_name AS manager_name
         FROM alerts a
-        LEFT JOIN customers c
-            ON c.id = a.customer_id
+        LEFT JOIN customers c ON c.id = a.customer_id
+        LEFT JOIN visits v
+          ON v.id = a.visit_id
+         AND v.organization_id = a.organization_id
+        LEFT JOIN territories t
+          ON t.id = v.territory_id
+         AND t.organization_id = v.organization_id
+        LEFT JOIN users rep
+          ON rep.id = v.user_id
+         AND rep.organization_id = v.organization_id
+        LEFT JOIN users manager
+          ON manager.id = rep.manager_id
+         AND manager.organization_id = rep.organization_id
         WHERE a.organization_id = :organization_id
     """
-
-    params = {
-        "organization_id": organization_id,
-    }
+    params = {"organization_id": organization_id, "user_id": user_id}
 
     if role == "FIELD_REP":
+        query += " AND (a.assigned_to = :user_id OR a.assigned_to IS NULL) AND v.user_id = :user_id"
+    elif role == "MANAGER":
         query += """
-            AND (
-                a.assigned_to = :user_id
-                OR a.assigned_to IS NULL
+          AND (
+            v.user_id = :user_id
+            OR EXISTS (
+              SELECT 1 FROM users direct_rep
+              WHERE direct_rep.id = v.user_id
+                AND direct_rep.organization_id = :organization_id
+                AND direct_rep.manager_id = :user_id
+                AND direct_rep.role = 'FIELD_REP'
             )
+          )
         """
-        params["user_id"] = user_id
 
     if visit_id:
-        query += """
-            AND a.visit_id = :visit_id
-        """
+        query += " AND a.visit_id = :visit_id"
         params["visit_id"] = visit_id
-
     if status:
-        query += """
-            AND a.status = :status
-        """
+        query += " AND a.status = :status"
         params["status"] = status
+    if territory_id:
+        query += " AND v.territory_id = :territory_id"
+        params["territory_id"] = territory_id
+    if manager_id:
+        query += " AND rep.manager_id = :manager_id"
+        params["manager_id"] = manager_id
+    if field_rep_id:
+        query += " AND v.user_id = :field_rep_id"
+        params["field_rep_id"] = field_rep_id
 
-    query += """
-        ORDER BY a.created_at DESC
-    """
+    query += " ORDER BY a.created_at DESC"
 
-    result = db.execute(
-        text(query),
-        params,
-    )
+    result = db.execute(text(query), params)
+    alerts = [dict(row) for row in result.mappings().all()]
+    return {"status": "success", "count": len(alerts), "alerts": alerts}
 
-    alerts = [
-        dict(row)
-        for row in result.mappings().all()
-    ]
-
-    return {
-        "status": "success",
-        "count": len(alerts),
-        "alerts": alerts,
-    }

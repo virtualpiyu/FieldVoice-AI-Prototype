@@ -139,6 +139,11 @@ class CustomerAssignmentRequest(BaseModel):
     territory_id: str | None = None
 
 
+class CustomerHandoverRequest(BaseModel):
+    target_rep_id: str
+    customer_ids: list[str] = Field(default_factory=list, min_length=1)
+
+
 class EmployeeCreateRequest(BaseModel):
     full_name: str = Field(min_length=1)
     email: str = Field(min_length=3)
@@ -699,6 +704,149 @@ def assign_customer(
     ).mappings().first()
 
     return {"status": "success", "message": "Customer assignment updated successfully.", "customer": dict(updated) if updated else None}
+
+
+# =========================================================
+# FIELD REP CUSTOMER HANDOVER
+# =========================================================
+@router.post("/field-reps/{source_rep_id}/customer-handover")
+def handover_rep_customers(
+    source_rep_id: str,
+    payload: CustomerHandoverRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    actor_role = require_exec_or_manager(current_user)
+    organization_id = str(current_user["organization_id"])
+    actor_id = str(current_user["id"])
+    source_id = str(source_rep_id)
+    target_id = str(payload.target_rep_id)
+    customer_ids = list(dict.fromkeys(str(x) for x in payload.customer_ids if str(x).strip()))
+
+    if not customer_ids:
+        raise HTTPException(status_code=400, detail="Select at least one customer to hand over.")
+    if source_id == target_id:
+        raise HTTPException(status_code=400, detail="Source and target Field Rep must be different.")
+
+    reps = db.execute(
+        text("""
+            SELECT
+                u.id, u.full_name, u.role, u.is_active, u.manager_id,
+                u.territory_id, t.name AS territory_name
+            FROM users u
+            LEFT JOIN territories t
+              ON t.id = u.territory_id
+             AND t.organization_id = u.organization_id
+            WHERE u.organization_id = :organization_id
+              AND u.id IN (:source_id, :target_id)
+        """),
+        {"organization_id": organization_id, "source_id": source_id, "target_id": target_id},
+    ).mappings().all()
+    rep_map = {str(r["id"]): r for r in reps}
+
+    source = rep_map.get(source_id)
+    target = rep_map.get(target_id)
+    if not source or str(source["role"]).upper() != "FIELD_REP" or not source["is_active"]:
+        raise HTTPException(status_code=404, detail="Source Field Rep is not active or does not exist.")
+    if not target or str(target["role"]).upper() != "FIELD_REP" or not target["is_active"]:
+        raise HTTPException(status_code=404, detail="Target Field Rep is not active or does not exist.")
+
+    if actor_role == "MANAGER":
+        if str(source["manager_id"] or "") != actor_id or str(target["manager_id"] or "") != actor_id:
+            raise HTTPException(status_code=403, detail="You can only hand over customers between your Field Reps.")
+        for territory_id in {str(source["territory_id"]) if source["territory_id"] else "", str(target["territory_id"]) if target["territory_id"] else ""}:
+            if territory_id and not manager_manages_region(db, actor_id, territory_id, organization_id):
+                raise HTTPException(status_code=403, detail="A Field Rep is outside your managed regions.")
+
+    if source["territory_id"] and target["territory_id"] and str(source["territory_id"]) != str(target["territory_id"]):
+        raise HTTPException(status_code=400, detail="Handover must stay within the same region. Reassign the target Field Rep's region first.")
+
+    customer_rows = db.execute(
+        text("""
+            SELECT id, name, territory_id, assigned_to
+            FROM customers
+            WHERE organization_id = :organization_id
+              AND id = ANY(CAST(:customer_ids AS uuid[]))
+              AND assigned_to = :source_id
+            FOR UPDATE
+        """),
+        {"organization_id": organization_id, "customer_ids": customer_ids, "source_id": source_id},
+    ).mappings().all()
+
+    found_ids = {str(row["id"]) for row in customer_rows}
+    missing = [cid for cid in customer_ids if cid not in found_ids]
+    if missing:
+        raise HTTPException(status_code=409, detail="One or more selected customers are no longer owned by the source Field Rep. Refresh and try again.")
+
+    if target["territory_id"]:
+        invalid_region = [row["name"] for row in customer_rows if str(row["territory_id"] or "") != str(target["territory_id"])]
+        if invalid_region:
+            raise HTTPException(status_code=409, detail="Every selected customer must belong to the target Field Rep's region.")
+
+    db.execute(
+        text("""
+            UPDATE customers
+            SET assigned_to = :target_id,
+                updated_at = now()
+            WHERE organization_id = :organization_id
+              AND id = ANY(CAST(:customer_ids AS uuid[]))
+              AND assigned_to = :source_id
+        """),
+        {"organization_id": organization_id, "customer_ids": customer_ids, "source_id": source_id, "target_id": target_id},
+    )
+    db.commit()
+
+    return {
+        "status": "success",
+        "message": f"{len(customer_rows)} customer(s) handed over successfully.",
+        "count": len(customer_rows),
+        "source_rep": {"id": source_id, "name": source["full_name"]},
+        "target_rep": {"id": target_id, "name": target["full_name"]},
+        "customer_ids": [str(row["id"]) for row in customer_rows],
+    }
+
+
+# =========================================================
+# FIELD REP CUSTOMER DIRECTORY
+# =========================================================
+@router.get("/field-reps/{rep_id}/customers")
+def get_rep_customers(
+    rep_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    actor_role = require_exec_or_manager(current_user)
+    organization_id = str(current_user["organization_id"])
+    actor_id = str(current_user["id"])
+
+    rep = same_org_user(db, rep_id, organization_id)
+    if not rep or role_of(rep) != "FIELD_REP":
+        raise HTTPException(status_code=404, detail="Field Rep not found in your organization.")
+    if actor_role == "MANAGER" and str(rep["manager_id"] or "") != actor_id:
+        raise HTTPException(status_code=403, detail="You can only view customers owned by your Field Reps.")
+
+    result = db.execute(
+        text("""
+            SELECT
+                c.id, c.name, c.contact_person, c.city, c.state, c.industry,
+                c.status, c.territory_id, t.name AS territory_name,
+                c.assigned_to, u.full_name AS assigned_user_name,
+                c.created_at, c.updated_at
+            FROM customers c
+            LEFT JOIN territories t
+              ON t.id = c.territory_id
+             AND t.organization_id = c.organization_id
+            LEFT JOIN users u
+              ON u.id = c.assigned_to
+             AND u.organization_id = c.organization_id
+            WHERE c.organization_id = :organization_id
+              AND c.assigned_to = :rep_id
+            ORDER BY c.name ASC
+        """),
+        {"organization_id": organization_id, "rep_id": rep_id},
+    )
+    customers = [dict(row) for row in result.mappings().all()]
+    return {"status": "success", "count": len(customers), "customers": customers}
 
 
 # =========================================================

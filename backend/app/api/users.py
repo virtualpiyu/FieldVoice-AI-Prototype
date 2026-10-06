@@ -408,10 +408,15 @@ def get_users(
             u.phone,
             u.is_active,
             u.manager_id,
+            u.territory_id,
+            t.name AS territory_name,
             u.created_at,
             u.updated_at,
             manager.full_name AS manager_name
         FROM users u
+        LEFT JOIN territories t
+          ON t.id = u.territory_id
+         AND t.organization_id = u.organization_id
         LEFT JOIN users manager
             ON manager.id = u.manager_id
            AND manager.organization_id = u.organization_id
@@ -498,10 +503,15 @@ def get_user_activity(
                 u.phone,
                 u.is_active,
                 u.manager_id,
+                u.territory_id,
+                t.name AS territory_name,
                 manager.full_name AS manager_name,
                 u.created_at,
                 u.updated_at
             FROM users u
+            LEFT JOIN territories t
+              ON t.id = u.territory_id
+             AND t.organization_id = u.organization_id
             LEFT JOIN users manager
                 ON manager.id = u.manager_id
                AND manager.organization_id = u.organization_id

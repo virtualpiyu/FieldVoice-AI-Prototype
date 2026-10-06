@@ -12,9 +12,85 @@ import {
 } from "lucide-react";
 import {
   Area, AreaChart, Bar, BarChart, CartesianGrid, Line, LineChart, Pie, PieChart,
-  Cell, ResponsiveContainer, Tooltip, XAxis, YAxis
+  Cell, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis
 } from "recharts";
 import { Circle as LeafletCircle, MapContainer, Marker, Popup, TileLayer } from "react-leaflet";
+
+// ─── CHART HELPERS ────────────────────────────────────────────────────────────
+function getChartTheme() {
+  const light = document.documentElement.dataset.theme === "light";
+  return {
+    light,
+    axis: light ? "#71819b" : "#7d747e",
+    grid: light ? "#dfe7f1" : "#2a242b",
+    muted: light ? "#667792" : "#8d808a",
+    tooltip: {
+      background: light ? "#ffffff" : "#1a1018",
+      color: light ? "#16345d" : "#eee4eb",
+      border: `1px solid ${light ? "#d8e2ee" : "#38272f"}`,
+      borderRadius: 8,
+    },
+  };
+}
+
+function chartDayKey(value: string | Date | null | undefined) {
+  if (!value) return "";
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return "";
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function buildSevenDayActivity(visits: ApiVisit[] = [], reports: ApiReport[] = [], userId?: string) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const days = Array.from({ length: 7 }, (_, index) => {
+    const day = new Date(today);
+    day.setDate(today.getDate() - (6 - index));
+    return day;
+  });
+
+  return days.map(day => {
+    const key = chartDayKey(day);
+    const dayVisits = visits.filter(v =>
+      (!userId || String(v.user_id) === String(userId)) && chartDayKey(v.visit_date) === key
+    );
+    const dayReports = reports.filter(r =>
+      (!userId || String(r.created_by || "") === String(userId)) && chartDayKey(r.created_at) === key
+    );
+    return {
+      day: day.toLocaleDateString(undefined, { weekday: "short" }),
+      visits: dayVisits.length,
+      reports: dayReports.length,
+    };
+  });
+}
+
+function buildHighSignalData(highOpportunities: number, highRisks: number) {
+  return [
+    { signal: "High opportunity", count: Number(highOpportunities || 0) },
+    { signal: "High risk", count: Number(highRisks || 0) },
+  ].filter(row => row.count > 0);
+}
+
+function buildTaskStatusData(tasks: ApiActionItem[] = []) {
+  const statuses = ["PENDING", "IN_PROGRESS", "COMPLETED", "CANCELLED"];
+  return statuses
+    .map(status => ({
+      status: status.replace(/_/g, " "),
+      count: tasks.filter(task => String(task.status || "").toUpperCase() === status).length,
+    }))
+    .filter(row => row.count > 0);
+}
+
+function buildReportStatusData(reports: ApiReport[] = []) {
+  const statuses = ["DRAFT", "EDITED", "SUBMITTED", "APPROVED", "REJECTED"];
+  return statuses
+    .map(status => ({
+      status: status.replace(/_/g, " "),
+      count: reports.filter(report => String(report.status || "").toUpperCase() === status).length,
+    }))
+    .filter(row => row.count > 0);
+}
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────
 type Role = "Salesperson" | "Manager" | "Executive";
@@ -40,8 +116,8 @@ type DashboardData = {
   status: string; role: string;
   overview: {
     total_visits: number; total_customers: number; pending_action_items: number;
-    open_alerts: number; total_leads: number; pipeline_value: number;
-    won_value: number; high_opportunities: number; high_risks: number;
+    open_alerts: number; total_leads: number;
+    high_opportunities: number; high_risks: number;
   };
   sentiment: { sentiment: string | null; count: number }[];
   pipeline: { stage: string; count: number; value: number }[];
@@ -67,6 +143,8 @@ type ApiTeamUser = {
   is_active?: boolean;
   manager_id?: string | null;
   manager_name?: string | null;
+  territory_id?: string | null;
+  territory_name?: string | null;
   created_at?: string;
   updated_at?: string;
 };
@@ -119,6 +197,9 @@ type ApiAlert = {
   id: string; severity: string; title: string; message: string;
   status: string; customer_name: string | null; alert_type?: string;
   created_at?: string;
+  territory_id?: string | null; region_name?: string | null;
+  rep_id?: string | null; rep_name?: string | null;
+  manager_id?: string | null; manager_name?: string | null;
 };
 
 type ApiLead = {
@@ -133,12 +214,39 @@ type ApiCustomer = {
   phone?: string | null; industry?: string | null; status?: string;
   latitude?: number | null; longitude?: number | null;
   address?: string | null; notes?: string | null; created_at?: string;
+  territory_id?: string | null; territory_name?: string | null;
+  assigned_to?: string | null; assigned_user_name?: string | null;
+};
+
+type LiveRepLocation = {
+  user_id: string;
+  full_name: string;
+  role: string;
+  manager_id?: string | null;
+  manager_name?: string | null;
+  territory_id?: string | null;
+  territory_name?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  accuracy?: number | null;
+  updated_at?: string | null;
+  status: "LIVE" | "STALE" | "OFFLINE";
+  has_location: boolean;
+  activity?: string | null;
+  active_customer_id?: string | null;
 };
 
 type ApiVisit = {
   id: string; customer_id: string; customer_name: string;
   user_id: string; user_name: string; visit_date: string;
   status: string; visit_type: string; notes: string | null;
+  territory_id?: string | null; region_name?: string | null;
+  manager_id?: string | null; manager_name?: string | null;
+  user_role?: string | null;
+  approval_status?: string | null;
+  approved_by?: string | null; approved_at?: string | null; approved_by_name?: string | null;
+  rejected_by?: string | null; rejected_at?: string | null; rejected_by_name?: string | null;
+  rejection_reason?: string | null;
   latitude?: number | null; longitude?: number | null;
 };
 
@@ -163,6 +271,10 @@ type ApiReport = {
   customer_name: string;
   created_by?: string | null;
   created_by_name: string;
+  manager_id?: string | null;
+  manager_name?: string | null;
+  territory_id?: string | null;
+  region_name?: string | null;
 
   submitted_at: string | null;
   created_at: string;
@@ -196,6 +308,16 @@ function uiRole(role: string): Role | null {
 }
 function money(v: number | null | undefined) {
   return new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(v || 0);
+}
+
+function distanceMeters(lat1: number, lon1: number, lat2: number, lon2: number) {
+  const R = 6371000;
+  const toRad = (value: number) => value * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
 }
 function timeFmt(s: number) {
   return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
@@ -396,28 +518,6 @@ function RecentVisits({ dashboard }: { dashboard: DashboardData | null }) {
   );
 }
 
-// ─── PIPELINE CHART ───────────────────────────────────────────────────────────
-function PipelineBar({ pipeline }: { pipeline: { stage: string; count: number; value: number }[] }) {
-  if (!pipeline.length) return <Empty text="No pipeline data." />;
-  const total = pipeline.reduce((s, p) => s + p.count, 0) || 1;
-  const colors: Record<string, string> = {
-    NEW: "#6c8cff", QUALIFIED: "#f5b84b", PROPOSAL: "#b83b68",
-    NEGOTIATION: "#dd5a74", WON: "#4caf7d", LOST: "#7f7180"
-  };
-  return (
-    <div style={{ display: "grid", gap: 10, marginTop: 8 }}>
-      {pipeline.map(p => (
-        <div className="pipeline-row" key={p.stage}>
-          <span style={{ color: colors[p.stage] || "#aaa" }}>{p.stage}</span>
-          <div className="pipeline-bar-track">
-            <div className="pipeline-bar-fill" style={{ width: `${Math.min(100, (p.count / total) * 100)}%`, background: colors[p.stage] || "#b83b68" }} />
-          </div>
-          <strong>{money(p.value)}</strong>
-        </div>
-      ))}
-    </div>
-  );
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // LOGIN PAGE
@@ -510,6 +610,7 @@ export default function App() {
   const [view, setView] = useState<View>("home");
   const [menu, setMenu] = useState(false);
   const [mobile, setMobile] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("fv_sidebar_collapsed") === "1");
   const [toast, setToast] = useState("");
   const [modal, setModal] = useState<{ title: string; message: string; type?: "success" | "error" | "info"; action?: string } | null>(null);
   const [searchQ, setSearchQ] = useState("");
@@ -572,6 +673,13 @@ export default function App() {
   // ── Helpers
   const notify = (m: string) => setToast(m);
   const go = (v: View) => { setView(v); setMenu(false); setMobile(false); };
+  const toggleSidebar = () => {
+    setSidebarCollapsed(current => {
+      const next = !current;
+      localStorage.setItem("fv_sidebar_collapsed", next ? "1" : "0");
+      return next;
+    });
+  };
   const showModal = (title: string, message: string, type: "success" | "error" | "info" = "info", action?: string) =>
     setModal({ title, message, type, action });
   const closeModal = () => setModal(null);
@@ -678,6 +786,45 @@ export default function App() {
     const x = setInterval(() => load(), 30000);
     return () => clearInterval(x);
   }, [user, load]);
+
+  // ─── Field Rep live location sharing ─────────────────────────────────────
+  // Additive MVP feature: while a Field Rep is signed in, publish the browser
+  // GPS position to the lightweight territory-live service. Existing visit
+  // location capture remains unchanged.
+  useEffect(() => {
+    if (!user || role !== "Salesperson" || !navigator.geolocation) return;
+
+    let disposed = false;
+
+    const publishLocation = () => {
+      navigator.geolocation.getCurrentPosition(
+        position => {
+          if (disposed) return;
+          void apiPost("/territory-live/location", {
+            latitude: position.coords.latitude,
+            longitude: position.coords.longitude,
+            accuracy: position.coords.accuracy,
+            active_customer_id: activeVisit?.customer_id || null,
+            activity: activeVisit ? "ACTIVE VISIT" : "FIELD ACTIVE",
+          }).catch(() => {
+            // Location sharing must never block the existing MVP workflow.
+          });
+        },
+        () => {
+          // GPS permission/availability failures are intentionally silent.
+        },
+        { enableHighAccuracy: true, maximumAge: 15000, timeout: 10000 }
+      );
+    };
+
+    publishLocation();
+    const timer = window.setInterval(publishLocation, 15000);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [user, role, activeVisit]);
 
   // ─── Action-item live synchronization ────────────────────────────────────
   // Management workspaces refresh task state frequently without reloading the
@@ -795,6 +942,8 @@ export default function App() {
         status: "IN_PROGRESS",
         visit_type: "CUSTOMER_VISIT",
         notes: "Offline visit — pending server sync.",
+        user_role: String(user?.role || "").toUpperCase() || null,
+        approval_status: "NOT_REQUIRED",
         latitude: customer.latitude,
         longitude: customer.longitude,
       };
@@ -822,7 +971,10 @@ export default function App() {
         id: `offline-visit-${Date.now()}`, customer_id: customer.id, customer_name: customer.name,
         user_id: user?.id || "offline-user", user_name: user?.full_name || "Field Representative",
         visit_date: new Date().toISOString(), status: "IN_PROGRESS", visit_type: "CUSTOMER_VISIT",
-        notes: "Offline visit — pending server sync.", latitude: customer.latitude, longitude: customer.longitude,
+        notes: "Offline visit — pending server sync.",
+        user_role: String(user?.role || "").toUpperCase() || null,
+        approval_status: "NOT_REQUIRED",
+        latitude: customer.latitude, longitude: customer.longitude,
       };
       setActiveVisit(localVisit);
       go("record");
@@ -983,11 +1135,98 @@ export default function App() {
     setReport(null); setGenerated(false);
   }
 
+  // ─── Server visit resolution for voice upload ─────────────────────────────
+  // Offline-first visits use a local `offline-visit-*` id until they reach the
+  // server. Never send that local id to PostgreSQL, because visits.id is a UUID.
+  // This preserves the existing offline flow while transparently resolving the
+  // visit once connectivity is available.
+  async function ensureServerVisitForUpload(): Promise<string> {
+    const currentVisit = activeVisit;
+    if (!currentVisit?.id) {
+      throw new Error("No active visit is available for this recording.");
+    }
+
+    const currentVisitId = String(currentVisit.id);
+    if (!currentVisitId.startsWith("offline-visit-")) {
+      return currentVisitId;
+    }
+
+    // Stay fully offline-first. The existing IndexedDB queue handles this case.
+    if (!navigator.onLine) {
+      return currentVisitId;
+    }
+
+    const customerId = currentVisit.customer_id || selectedCustomer?.id;
+    if (!customerId) {
+      throw new Error("This offline visit has no customer reference, so it cannot be synced.");
+    }
+
+    setProcessingStep("Syncing visit…");
+
+    // Reuse a real in-progress visit if the offline queue already created one.
+    // This prevents duplicate server visits when the browser reconnects.
+    const existingServerVisit = visits.find(v =>
+      !String(v.id).startsWith("offline-visit-") &&
+      String(v.user_id) === String(user?.id) &&
+      String(v.customer_id) === String(customerId) &&
+      String(v.status || "").toUpperCase() === "IN_PROGRESS"
+    );
+
+    if (existingServerVisit) {
+      const resolvedVisit: ApiVisit = {
+        ...currentVisit,
+        ...existingServerVisit,
+        customer_id: customerId,
+        customer_name: existingServerVisit.customer_name || currentVisit.customer_name,
+        user_id: existingServerVisit.user_id || currentVisit.user_id,
+        user_name: existingServerVisit.user_name || currentVisit.user_name,
+      };
+      setActiveVisit(resolvedVisit);
+      return String(existingServerVisit.id);
+    }
+
+    const response = await fetch(
+      `${API_BASE_URL}/visits/?customer_id=${encodeURIComponent(customerId)}&visit_type=CUSTOMER_VISIT&status_value=IN_PROGRESS`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${token()}`,
+        },
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(await apiError(response));
+    }
+
+    const data = await response.json();
+    const serverVisit: ApiVisit = data?.visit || data;
+    const serverId = String(serverVisit?.id || "");
+
+    if (!serverId || serverId.startsWith("offline-visit-")) {
+      throw new Error("The server did not return a valid visit ID.");
+    }
+
+    const resolvedVisit: ApiVisit = {
+      ...currentVisit,
+      ...serverVisit,
+      customer_id: customerId,
+      customer_name: serverVisit.customer_name || currentVisit.customer_name,
+      user_id: serverVisit.user_id || currentVisit.user_id,
+      user_name: serverVisit.user_name || currentVisit.user_name,
+    };
+
+    setActiveVisit(resolvedVisit);
+    setVisits(prev => [resolvedVisit, ...prev.filter(v => v.id !== resolvedVisit.id)]);
+
+    return serverId;
+  }
+
   // ─── Upload & AI processing ───────────────────────────────────────────────
   async function uploadAndProcess() {
     if (!audioBlob) return;
-    const visitId = activeVisit?.id;
-    if (!visitId) {
+    if (!activeVisit?.id) {
       showModal("No Active Visit", "Please start a visit before uploading a voice note.", "error");
       return;
     }
@@ -996,6 +1235,10 @@ export default function App() {
     setProcessingStep("Uploading voice note…");
 
     try {
+      // Resolve offline visit shells to real UUIDs before calling the backend.
+      // This is only needed after reconnect; normal online visits are unchanged.
+      const visitId = await ensureServerVisitForUpload();
+
       // 1. Upload voice note
       const fd = new FormData();
       fd.append("visit_id", visitId);
@@ -1012,11 +1255,106 @@ export default function App() {
       if (!upRes.ok) throw new Error(`Upload failed: ${await apiError(upRes)}`);
       const upData = await upRes.json();
 
+      // The backend now returns immediately after storing the audio.
+      // Poll the lightweight status endpoint while Gemini works in the background.
+      let voiceNote = upData.voice_note || {};
+      let aiAnalysis = upData.ai_analysis || {};
+      if (upData.processing && voiceNote.id) {
+        setProcessingStep("Voice note uploaded ✓ — AI transcription starting…");
+        const maxPolls = 60;
+        for (let attempt = 0; attempt < maxPolls; attempt++) {
+          await new Promise(resolve => setTimeout(resolve, 1500));
+          const statusRes = await fetch(
+            `${API_BASE_URL}/voice-notes/${encodeURIComponent(voiceNote.id)}/status`,
+            { headers: { Accept: "application/json", Authorization: `Bearer ${token()}` } }
+          );
+          if (!statusRes.ok) continue;
+          const statusData = await statusRes.json();
+          voiceNote = statusData.voice_note || voiceNote;
+          aiAnalysis = statusData.ai_analysis || aiAnalysis;
+
+          // Be tolerant of JSONB/string payloads from PostgreSQL and merge
+          // action items returned by the status endpoint. Older status payloads
+          // did not include action_items, which caused the report UI to fall
+          // back to generic placeholder text.
+          if (aiAnalysis && typeof aiAnalysis.key_insights === "string") {
+            try {
+              const parsed = JSON.parse(aiAnalysis.key_insights);
+              if (Array.isArray(parsed)) aiAnalysis.key_insights = parsed;
+            } catch {
+              aiAnalysis.key_insights = aiAnalysis.key_insights.trim()
+                ? [aiAnalysis.key_insights.trim()]
+                : [];
+            }
+          }
+          if (aiAnalysis && typeof aiAnalysis.action_items === "string") {
+            try {
+              const parsed = JSON.parse(aiAnalysis.action_items);
+              if (Array.isArray(parsed)) aiAnalysis.action_items = parsed;
+            } catch {
+              aiAnalysis.action_items = aiAnalysis.action_items.trim()
+                ? [aiAnalysis.action_items.trim()]
+                : [];
+            }
+          }
+          if (statusData.processing_status === "COMPLETED") {
+            // Status payload is the preferred source. As a safety net, fetch the
+            // canonical AI insight/action endpoints once after completion so an
+            // older or partially deployed status response can never make the
+            // report fall back to generic placeholder text.
+            try {
+              const insightRes = await fetch(
+                `${API_BASE_URL}/ai-insights/?visit_id=${encodeURIComponent(visitId)}`,
+                { headers: { Accept: "application/json", Authorization: `Bearer ${token()}` } }
+              );
+              if (insightRes.ok) {
+                const insightData = await insightRes.json();
+                const insight = Array.isArray(insightData?.ai_insights) ? insightData.ai_insights[0] : null;
+                if (insight) {
+                  aiAnalysis = {
+                    ...aiAnalysis,
+                    summary: insight.summary ?? aiAnalysis.summary,
+                    sentiment: insight.sentiment ?? aiAnalysis.sentiment,
+                    key_insights: insight.key_insights ?? aiAnalysis.key_insights,
+                    opportunity_signal: insight.opportunity_level ?? aiAnalysis.opportunity_signal,
+                    risk_signal: insight.risk_level ?? aiAnalysis.risk_signal,
+                  };
+                }
+              }
+            } catch (error) {
+              console.warn("AI insight refresh failed; using status payload:", error);
+            }
+
+            try {
+              const actionRes = await fetch(
+                `${API_BASE_URL}/action-items/?visit_id=${encodeURIComponent(visitId)}`,
+                { headers: { Accept: "application/json", Authorization: `Bearer ${token()}` } }
+              );
+              if (actionRes.ok) {
+                const actionData = await actionRes.json();
+                const serverActions = Array.isArray(actionData?.action_items)
+                  ? actionData.action_items
+                      .map((item: any) => String(item?.title || item?.description || "").trim())
+                      .filter(Boolean)
+                  : [];
+                if (serverActions.length) aiAnalysis.action_items = serverActions;
+              }
+            } catch (error) {
+              console.warn("Action item refresh failed; using status payload:", error);
+            }
+
+            break;
+          }
+          if (statusData.processing_status === "FAILED") {
+            throw new Error("AI processing failed. Check the backend terminal for the processing error.");
+          }
+          setProcessingStep(attempt < 12 ? "Transcribing voice note…" : "Analyzing visit with AI…");
+        }
+      }
+
       setProcessingStep("Generating AI report draft…");
 
       // 2. Create report draft
-      const voiceNote = upData.voice_note || {};
-      const aiAnalysis = upData.ai_analysis || {};
       let reportData: any = null;
 
       try {
@@ -1045,10 +1383,14 @@ export default function App() {
 
       const insights = Array.isArray(aiAnalysis.key_insights)
         ? aiAnalysis.key_insights.filter(Boolean).map(String)
-        : [];
+        : (typeof aiAnalysis.key_insights === "string" && aiAnalysis.key_insights.trim()
+          ? [aiAnalysis.key_insights.trim()]
+          : []);
       const actions = Array.isArray(aiAnalysis.action_items)
         ? aiAnalysis.action_items.filter(Boolean).map(String)
-        : [];
+        : (typeof aiAnalysis.action_items === "string" && aiAnalysis.action_items.trim()
+          ? [aiAnalysis.action_items.trim()]
+          : []);
 
       const builtReport: Report = {
         id: reportData?.report?.id || `FV-${Date.now()}`,
@@ -1142,7 +1484,20 @@ export default function App() {
           );
           if (!visitRes.ok) throw new Error(await apiError(visitRes));
           const visitData = await visitRes.json();
-          serverVisitId = (visitData.visit || visitData).id;
+          const syncedVisit = (visitData.visit || visitData) as ApiVisit;
+          serverVisitId = syncedVisit.id;
+
+          // Keep an open UI visit synchronized with the server-side UUID.
+          if (activeVisit?.id === row.visitId && serverVisitId) {
+            setActiveVisit(prev => prev ? {
+              ...prev,
+              ...syncedVisit,
+              customer_id: syncedVisit.customer_id || prev.customer_id,
+              customer_name: syncedVisit.customer_name || prev.customer_name,
+              user_id: syncedVisit.user_id || prev.user_id,
+              user_name: syncedVisit.user_name || prev.user_name,
+            } : prev);
+          }
         }
         const fd = new FormData();
         fd.append("visit_id", serverVisitId);
@@ -1186,7 +1541,15 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
       await apiPost(`/reports/${current.reportId}/submit`);
       await completeVisit(current.visitId || "");
       await load();
-      showModal("Report Submitted", "Your field report has been submitted to management successfully.", "success", "Back to dashboard");
+      const isManagerUser = String(user?.role || "").toUpperCase() === "MANAGER";
+      showModal(
+        isManagerUser ? "Visit Sent for Approval" : "Report Submitted",
+        isManagerUser
+          ? "Your visit and voice report are completed and the visit is now waiting for Executive approval."
+          : "Your field report has been submitted to management successfully.",
+        "success",
+        "Back to dashboard"
+      );
     } catch (e: any) {
       showModal("Submission Failed", e.message || "Could not submit report.", "error");
     }
@@ -1273,7 +1636,9 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
   const managerNav = [
     { id: "home", label: "Dashboard", icon: LayoutDashboard },
     { id: "visits", label: "Team Visits", icon: MapPin },
+    { id: "record", label: "Record Visit", icon: Mic },
     { id: "reports", label: "Reports", icon: FileText },
+    { id: "history", label: "History", icon: History },
     { id: "customers", label: "Customers", icon: Users },
     { id: "tasks", label: "Action Items", icon: ClipboardCheck },
     { id: "alerts", label: "Alerts", icon: Bell },
@@ -1285,6 +1650,8 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
   const executiveNav = [
     { id: "home", label: "Executive View", icon: Gauge },
     { id: "reports", label: "Reports", icon: FileText },
+    { id: "visits", label: "Visits", icon: MapPin },
+    { id: "customers", label: "Customers", icon: Users },
     { id: "tasks", label: "Action Items", icon: ClipboardCheck },
     { id: "insights", label: "AI Intelligence", icon: Sparkles },
     { id: "map", label: "Territory", icon: Navigation },
@@ -1317,7 +1684,7 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
 
   // ─── MAIN SHELL ───────────────────────────────────────────────────────────
   return (
-    <div className="shell">
+    <div className={`shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
       {/* SIDEBAR */}
       <nav className={`sidebar ${mobile ? "open" : ""}`}>
         <div className="sidebar-brand">
@@ -1332,6 +1699,7 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
           {navItems.map(n => (
             <button
               key={n.id}
+              title={n.label}
               className={`nav-item ${view === n.id || (view === "visit-detail" && n.id === "visits") || (view === "customer-detail" && n.id === "customers") ? "active" : ""}`}
               onClick={() => go(n.id as View)}
             >
@@ -1360,6 +1728,14 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
         {/* TOPBAR */}
         <header className="topbar">
           <div className="topbar-left">
+            <button
+              className="sidebar-toggle icon-btn desktop-only"
+              onClick={toggleSidebar}
+              aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+              title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            >
+              <Menu size={19} />
+            </button>
             <button className="mobile-only icon-btn" onClick={() => setMobile(true)}><Menu size={20} /></button>
             <div className="crumb">
               <span>FieldVoice</span>
@@ -1475,8 +1851,18 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
             <ManagerViews
               view={view} dashboard={dashboard} tasks={tasks} alerts={alerts}
               leads={leads} customers={customers} visits={visits} reports={reports}
-              user={user} onGo={go} onUpdateTask={updateTaskStatus}
-              onUpdateAlert={updateAlertStatus} onOpenCustomer={openCustomer}
+              report={report} generated={generated} editing={editing}
+              recording={recording} processing={processing} processingStep={processingStep}
+              seconds={seconds} audioUrl={audioUrl} audioBlob={audioBlob} micLevel={micLevel}
+              online={online} user={user} selectedCustomer={selectedCustomer}
+              activeVisit={activeVisit} selectedVisit={selectedVisit}
+              setEditing={setEditing} setReport={setReport}
+              onGo={go} onStartVisit={startVisit} onStartRec={startRecording}
+              onStopRec={stopRecording} onDiscard={discardRecording}
+              onUpload={uploadAndProcess} onSubmit={submitReport}
+              onEmail={() => go("email")} onRecordAgain={() => { discardRecording(); go("record"); }}
+              onUpdateTask={updateTaskStatus} onUpdateAlert={updateAlertStatus}
+              onOpenCustomer={openCustomer} onOpenVisit={openVisit}
               selectedCustomerDetail={selectedCustomerDetail}
               teamUsers={teamUsers}
               onOpenRepActivity={openRepActivity}
@@ -1488,7 +1874,9 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
               view={view} dashboard={dashboard} alerts={alerts}
               leads={leads} customers={customers} visits={visits} reports={reports}
               tasks={tasks} onGo={go} onUpdateTask={updateTaskStatus}
-              user={user} teamUsers={teamUsers} onOpenRepActivity={openRepActivity} onRefresh={load} onNotify={notify}
+              user={user} teamUsers={teamUsers} onOpenRepActivity={openRepActivity}
+              onOpenCustomer={openCustomer} onStartVisit={startVisit} selectedCustomerDetail={selectedCustomerDetail}
+              onRefresh={load} onNotify={notify}
             />
           )}
 
@@ -1500,6 +1888,11 @@ ${edited.actions.map(x => `• ${x}`).join("\n")}`,
               loading={!selectedRepActivity}
               onBack={() => go("team")}
               onRefresh={() => openRepActivity(selectedRep)}
+              visits={visits}
+              reports={reports}
+              teamUsers={teamUsers}
+              currentUser={user}
+              onNotify={notify}
             />
           )}
           {view === "settings" && (
@@ -1551,6 +1944,7 @@ function SalespersonViews(props: any) {
   if (view === "customer-detail") return <CustomerDetailView {...props} />;
   if (view === "tasks") return <TasksView {...props} />;
   if (view === "alerts") return <AlertsView {...props} />;
+  if (view === "insights") return <InsightsView dashboard={props.dashboard} alerts={props.alerts} tasks={props.tasks} visits={props.visits} reports={props.reports} />;
   if (view === "history") return <HistoryView {...props} />;
   if (view === "map") return <TerritoryView customers={props.customers} />;
   if (view === "settings" || view === "email" || view === "rep-activity") return null;
@@ -2201,9 +2595,219 @@ function AISignalRow({ icon: Icon, label, value }: { icon: any; label: string; v
   );
 }
 
+
+// ─── SHARED ORGANIZATION FILTERS ─────────────────────────────────────────────
+type OrgFilterState = {
+  regionId: string;
+  managerId: string;
+  repId: string;
+  status: string;
+  dateFrom: string;
+  dateTo: string;
+};
+
+type OrgRegionOption = {
+  id: string;
+  name: string;
+  city?: string | null;
+  state?: string | null;
+  is_active?: boolean;
+};
+
+type OrgTreeRep = {
+  id: string;
+  full_name: string;
+  email?: string | null;
+  is_active?: boolean;
+  manager_id?: string | null;
+  territory_id?: string | null;
+  territory_name?: string | null;
+};
+
+type OrgTreeManager = {
+  id: string;
+  full_name: string;
+  is_active?: boolean;
+  regions?: Array<{ territory_id: string; territory_name: string; is_active?: boolean }>;
+  field_reps?: OrgTreeRep[];
+};
+
+function ManagementFilterBar({
+  user,
+  statusOptions,
+  onChange,
+}: {
+  user: AuthUser | null;
+  statusOptions: string[];
+  onChange: (filters: OrgFilterState) => void;
+}) {
+  const [regions, setRegions] = useState<OrgRegionOption[]>([]);
+  const [managers, setManagers] = useState<OrgTreeManager[]>([]);
+  const [reps, setReps] = useState<OrgTreeRep[]>([]);
+  const [loadingOptions, setLoadingOptions] = useState(true);
+  const [optionsError, setOptionsError] = useState("");
+  const [filters, setFilters] = useState<OrgFilterState>({
+    regionId: "",
+    managerId: "",
+    repId: "",
+    status: "",
+    dateFrom: "",
+    dateTo: "",
+  });
+
+  const isManager = String(user?.role || "").toUpperCase() === "MANAGER";
+  const isExecutive = String(user?.role || "").toUpperCase() === "EXECUTIVE";
+
+  const loadRegions = useCallback(async () => {
+    try {
+      const response = await apiGet<{ regions?: OrgRegionOption[] }>("/org-management/regions");
+      setRegions(response?.regions || []);
+      setOptionsError("");
+    } catch (e: any) {
+      setOptionsError(e?.message || "Could not load regions.");
+    }
+  }, []);
+
+  const loadTree = useCallback(async (regionId: string, managerId: string) => {
+    try {
+      const params = new URLSearchParams();
+      if (regionId) params.set("region_id", regionId);
+      if (managerId) params.set("manager_id", managerId);
+      const qs = params.toString();
+      const response = await apiGet<{ managers?: OrgTreeManager[] }>(`/org-management/tree${qs ? `?${qs}` : ""}`);
+      const nextManagers = response?.managers || [];
+      setManagers(nextManagers);
+
+      const repSource = managerId
+        ? (nextManagers.find(m => String(m.id) === String(managerId))?.field_reps || [])
+        : nextManagers.flatMap(m => m.field_reps || []);
+      setReps(repSource.filter(rep => rep.is_active !== false));
+      setOptionsError("");
+    } catch (e: any) {
+      setManagers([]);
+      setReps([]);
+      setOptionsError(e?.message || "Could not load organizational scope.");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!user || (!isManager && !isExecutive)) return;
+    let cancelled = false;
+    setLoadingOptions(true);
+    Promise.all([loadRegions(), loadTree("", "")])
+      .finally(() => { if (!cancelled) setLoadingOptions(false); });
+    return () => { cancelled = true; };
+  }, [user, isManager, isExecutive, loadRegions, loadTree]);
+
+  useEffect(() => {
+    if (!user || (!isManager && !isExecutive)) return;
+    onChange(filters);
+  }, [filters, user, isManager, isExecutive, onChange]);
+
+  function updateFilters(patch: Partial<OrgFilterState>) {
+    setFilters(prev => ({ ...prev, ...patch }));
+  }
+
+  async function handleRegionChange(regionId: string) {
+    setFilters(prev => ({ ...prev, regionId, managerId: "", repId: "" }));
+    await loadTree(regionId, "");
+  }
+
+  async function handleManagerChange(managerId: string) {
+    setFilters(prev => ({ ...prev, managerId, repId: "" }));
+    await loadTree(filters.regionId, managerId);
+  }
+
+  function clearFilters() {
+    setFilters({ regionId: "", managerId: "", repId: "", status: "", dateFrom: "", dateTo: "" });
+    void loadTree("", "");
+  }
+
+  const hasFilters = Object.values(filters).some(Boolean);
+
+  if (!user || (!isManager && !isExecutive)) return null;
+
+  return (
+    <section className="panel org-data-filter-panel">
+      <div className="org-data-filter-head">
+        <div>
+          <span className="eyebrow">ORGANIZATIONAL FILTERS</span>
+          <strong>Region → Manager → Field Rep</strong>
+          <span>Use the same organizational hierarchy to narrow this view.</span>
+        </div>
+        {hasFilters && <button type="button" className="text-button" onClick={clearFilters}>Clear filters</button>}
+      </div>
+
+      {optionsError && <div className="auth-error" style={{ marginBottom: 10 }}><AlertTriangle size={13} /><span>{optionsError}</span></div>}
+
+      <div className="org-data-filter-grid">
+        <label className="organization-filter-control">
+          <span>Region</span>
+          <select value={filters.regionId} onChange={e => void handleRegionChange(e.target.value)} disabled={loadingOptions}>
+            <option value="">All regions</option>
+            {regions.map(region => <option key={region.id} value={region.id}>{region.name}</option>)}
+          </select>
+        </label>
+
+        {isExecutive && (
+          <label className="organization-filter-control">
+            <span>Manager</span>
+            <select value={filters.managerId} onChange={e => void handleManagerChange(e.target.value)} disabled={loadingOptions || !managers.length}>
+              <option value="">All managers</option>
+              {managers.map(manager => <option key={manager.id} value={manager.id}>{manager.full_name}</option>)}
+            </select>
+          </label>
+        )}
+
+        <label className="organization-filter-control">
+          <span>Field Rep</span>
+          <select value={filters.repId} onChange={e => updateFilters({ repId: e.target.value })} disabled={loadingOptions || !reps.length}>
+            <option value="">All Field Reps</option>
+            {reps.map(rep => <option key={rep.id} value={rep.id}>{rep.full_name}</option>)}
+          </select>
+        </label>
+
+        <label className="organization-filter-control">
+          <span>Status</span>
+          <select value={filters.status} onChange={e => updateFilters({ status: e.target.value })}>
+            <option value="">All statuses</option>
+            {statusOptions.map(status => <option key={status} value={status}>{status.replace("_", " ")}</option>)}
+          </select>
+        </label>
+
+        <label className="organization-filter-control">
+          <span>Date from</span>
+          <input type="date" value={filters.dateFrom} onChange={e => updateFilters({ dateFrom: e.target.value })} />
+        </label>
+
+        <label className="organization-filter-control">
+          <span>Date to</span>
+          <input type="date" value={filters.dateTo} onChange={e => updateFilters({ dateTo: e.target.value })} />
+        </label>
+      </div>
+    </section>
+  );
+}
+
+function toFilterQuery(filters: OrgFilterState, dateFieldMode: "created_at" | "visit_date") {
+  const params = new URLSearchParams();
+  if (filters.regionId) params.set("territory_id", filters.regionId);
+  if (filters.managerId) params.set("manager_id", filters.managerId);
+  if (filters.repId) params.set("user_id", filters.repId);
+  if (filters.status) {
+    params.set(dateFieldMode === "created_at" ? "status" : "status_value", filters.status);
+  }
+  if (filters.dateFrom) params.set("date_from", `${filters.dateFrom}T00:00:00`);
+  if (filters.dateTo) params.set("date_to", `${filters.dateTo}T23:59:59.999`);
+  return params.toString();
+}
+
 // ─── REPORTS LIST VIEW ────────────────────────────────────────────────────────
 function ReportsListView({ reports, user, onRefresh, onNotify }: any) {
   const [filter, setFilter] = useState("ALL");
+  const [orgFilteredReports, setOrgFilteredReports] = useState<ApiReport[]>(reports);
+  const [orgFilters, setOrgFilters] = useState<OrgFilterState>({ regionId: "", managerId: "", repId: "", status: "", dateFrom: "", dateTo: "" });
+  const [orgLoading, setOrgLoading] = useState(false);
   const [selected, setSelected] = useState<ApiReport | null>(null);
 
   const [voiceNote, setVoiceNote] = useState<ApiVoiceNote | null>(null);
@@ -2224,6 +2828,31 @@ function ReportsListView({ reports, user, onRefresh, onNotify }: any) {
   String(user?.role || "").toUpperCase() === "FIELD_REP" ||
   String(user?.role || "").toUpperCase() === "SALESPERSON";
 
+  const isExecutive = String(user?.role || "").toUpperCase() === "EXECUTIVE";
+  const isManagement = isManager || isExecutive;
+
+  const loadOrgReports = useCallback(async (nextFilters: OrgFilterState) => {
+    if (!isManagement) return;
+    setOrgLoading(true);
+    try {
+      const qs = toFilterQuery(nextFilters, "created_at");
+      const response = await apiGet<{ reports?: ApiReport[] }>(`/reports/${qs ? `?${qs}` : ""}`);
+      setOrgFilteredReports(response?.reports || []);
+    } catch (e: any) {
+      onNotify?.(e?.message || "Could not load filtered reports.");
+    } finally {
+      setOrgLoading(false);
+    }
+  }, [isManagement, onNotify]);
+
+  useEffect(() => {
+    if (!isManagement) {
+      setOrgFilteredReports(reports);
+      return;
+    }
+    void loadOrgReports(orgFilters);
+  }, [reports, isManagement, orgFilters, loadOrgReports]);
+
   const reportStatusType = (status: string) => {
     const value = String(status || "").toUpperCase();
     if (value === "APPROVED") return "success";
@@ -2232,9 +2861,9 @@ function ReportsListView({ reports, user, onRefresh, onNotify }: any) {
     return "pending";
   };
 
-  const filtered = reports.filter(
-    (r: ApiReport) => filter === "ALL" || r.status === filter
-  );
+  const filtered = isManagement
+    ? (orgFilters.status ? orgFilteredReports : orgFilteredReports)
+    : reports.filter((r: ApiReport) => filter === "ALL" || r.status === filter);
 
   // Load the original field voice note whenever a report is opened.
   useEffect(() => {
@@ -2417,17 +3046,25 @@ async function resubmitSelected() {
         sub="All AI-generated field visit reports. Review content, original field voice, and submission status."
       />
 
-      <div className="filter-row">
-        {["ALL", "DRAFT", "EDITED", "SUBMITTED", "APPROVED", "REJECTED"].map(f => (
-          <button
-            key={f}
-            className={`pill ${filter === f ? "active-pill" : ""}`}
-            onClick={() => setFilter(f)}
-          >
-            {f === "ALL" ? "All" : f}
-          </button>
-        ))}
-      </div>
+      {isManagement ? (
+        <ManagementFilterBar
+          user={user}
+          statusOptions={["DRAFT", "EDITED", "SUBMITTED", "APPROVED", "REJECTED"]}
+          onChange={setOrgFilters}
+        />
+      ) : (
+        <div className="filter-row">
+          {["ALL", "DRAFT", "EDITED", "SUBMITTED", "APPROVED", "REJECTED"].map(f => (
+            <button
+              key={f}
+              className={`pill ${filter === f ? "active-pill" : ""}`}
+              onClick={() => setFilter(f)}
+            >
+              {f === "ALL" ? "All" : f}
+            </button>
+          ))}
+        </div>
+      )}
 
       <div className="panel" style={{ marginTop: 14 }}>
         {filtered.length === 0 ? (
@@ -2437,9 +3074,11 @@ async function resubmitSelected() {
           />
         ) : (
           <div className="table-list">
-            <div className="table-header">
+            <div className={`table-header ${isManagement ? "report-management-header" : ""}`}>
               <span>Customer</span>
-              <span>Created by</span>
+              <span>{isManagement ? "Field Rep" : "Created by"}</span>
+              {isManagement && <span>Manager</span>}
+              {isManagement && <span>Region</span>}
               <span>Status</span>
               <span>Date</span>
               <span />
@@ -2447,7 +3086,7 @@ async function resubmitSelected() {
 
             {filtered.map((r: ApiReport) => (
               <button
-                className="table-row report-click-row"
+                className={`table-row report-click-row ${isManagement ? "report-management-row" : ""}`}
                 key={r.id}
                 onClick={() => setSelected(r)}
                 type="button"
@@ -2467,6 +3106,18 @@ async function resubmitSelected() {
                 <span style={{ fontSize: 10 }}>
                   {r.created_by_name}
                 </span>
+
+                {isManagement && (
+                  <span style={{ fontSize: 9, color: "#8c7d88" }}>
+                    {r.manager_name || "—"}
+                  </span>
+                )}
+
+                {isManagement && (
+                  <span style={{ fontSize: 9, color: "#8c7d88" }}>
+                    {r.region_name || "—"}
+                  </span>
+                )}
 
                 <Badge
                   label={r.status}
@@ -3093,51 +3744,200 @@ async function resubmitSelected() {
 }
 
 // ─── CUSTOMERS VIEW ───────────────────────────────────────────────────────────
-function CustomersView({ customers, onGo, onOpenCustomer, onStartVisit, canStartVisit = true }: any) {
+function CustomersView({ customers, onGo, onOpenCustomer, onStartVisit, canStartVisit = true, user, teamUsers = [], onRefresh, onNotify }: any) {
   const [search, setSearch] = useState("");
+  const [createOpen, setCreateOpen] = useState(false);
+  const isManagementRole = ["MANAGER", "EXECUTIVE"].includes(String(user?.role || "").toUpperCase());
   const filtered = customers.filter((c: ApiCustomer) =>
     c.name.toLowerCase().includes(search.toLowerCase()) ||
     (c.city || "").toLowerCase().includes(search.toLowerCase()) ||
     (c.industry || "").toLowerCase().includes(search.toLowerCase())
   );
-
   return (
     <>
-      <SectionHeader eyebrow="CRM" title="Customers" sub="Your organization's customer accounts. Click a customer to view their complete profile." />
-      <div className="filter-row">
-        <div className="search-box wide">
-          <Search size={14} />
-          <input placeholder="Search customers, cities, industries…" value={search} onChange={e => setSearch(e.target.value)} />
-          {search && <button onClick={() => setSearch("")} style={{ border: 0, background: "transparent", color: "#8d808a" }}><X size={13} /></button>}
-        </div>
-      </div>
+      <SectionHeader eyebrow="CRM" title="Customers" sub="Your organization's customer accounts. Create, assign, and manage accounts from one workspace." action={isManagementRole ? <button className="button primary" onClick={() => setCreateOpen(true)}><Plus size={14} /> New Customer</button> : undefined} />
+      <div className="filter-row"><div className="search-box wide"><Search size={14} /><input placeholder="Search customers, cities, industries…" value={search} onChange={e => setSearch(e.target.value)} />{search && <button onClick={() => setSearch("")} style={{ border: 0, background: "transparent", color: "#8d808a" }}><X size={13} /></button>}</div></div>
       <div className="panel" style={{ marginTop: 14 }}>
-        {filtered.length === 0 ? <Empty text="No customers found." icon={Users} /> : (
-          <div style={{ display: "grid", gap: 8 }}>
-            {filtered.map((c: ApiCustomer) => (
-              <div className="customer-row" key={c.id} onClick={() => onOpenCustomer(c)} style={{ cursor: "pointer" }}>
-                <div className="avatar large">{initials(c.name)}</div>
-                <div style={{ flex: 1 }}>
-                  <strong>{c.name}</strong>
-                  <span>{[c.contact_person, c.city, c.industry].filter(Boolean).join(" · ")}</span>
-                </div>
-                <Badge label={c.status || "ACTIVE"} type={c.status === "ACTIVE" ? "success" : "pending"} />
-                {canStartVisit && onStartVisit && (
-                  <button className="button ghost" style={{ padding: "6px 12px", fontSize: 10 }} onClick={e => { e.stopPropagation(); onStartVisit(c); }}>
-                    <Mic size={11} /> Visit
-                  </button>
-                )}
-                <ChevronRight size={14} style={{ color: "#5d4d56" }} />
-              </div>
-            ))}
+        {filtered.length === 0 ? <Empty text="No customers found." icon={Users} /> : <div style={{ display: "grid", gap: 8 }}>{filtered.map((c: ApiCustomer) => (
+          <div className="customer-row" key={c.id} onClick={() => onOpenCustomer(c)} style={{ cursor: "pointer" }}>
+            <div className="avatar large">{initials(c.name)}</div><div style={{ flex: 1 }}><strong>{c.name}</strong><span>{[c.contact_person, c.city, c.industry].filter(Boolean).join(" · ")}</span></div>
+            <Badge label={c.status || "ACTIVE"} type={c.status === "ACTIVE" ? "success" : "pending"} />
+            {canStartVisit && onStartVisit && <button className="button ghost" style={{ padding: "6px 12px", fontSize: 10 }} onClick={e => { e.stopPropagation(); onStartVisit(c); }}><Mic size={11} /> Visit</button>}
+            <ChevronRight size={14} style={{ color: "#5d4d56" }} />
           </div>
-        )}
+        ))}</div>}
       </div>
+      {createOpen && <CreateCustomerModal user={user || null} teamUsers={teamUsers} onClose={() => setCreateOpen(false)} onCreated={async () => { await onRefresh?.(); }} onNotify={onNotify} />}
     </>
   );
 }
-
 // ─── CUSTOMER DETAIL VIEW ─────────────────────────────────────────────────────
+function CreateCustomerModal({
+  user,
+  teamUsers = [],
+  onClose,
+  onCreated,
+  onNotify,
+}: {
+  user: AuthUser | null;
+  teamUsers?: ApiTeamUser[];
+  onClose: () => void;
+  onCreated?: () => Promise<void> | void;
+  onNotify?: (message: string) => void;
+}) {
+  const isExecutive = String(user?.role || "").toUpperCase() === "EXECUTIVE";
+  const isManager = String(user?.role || "").toUpperCase() === "MANAGER";
+  const [regions, setRegions] = useState<OrgRegionOption[]>([]);
+  const [managers, setManagers] = useState<OrgTreeManager[]>([]);
+  const [reps, setReps] = useState<OrgTreeRep[]>([]);
+  const [loadingOptions, setLoadingOptions] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [form, setForm] = useState({
+    name: "", contact_person: "", email: "", phone: "", address: "",
+    city: "", state: "", industry: "", notes: "", country: "India",
+    territory_id: "", manager_id: "", assigned_to: "",
+  });
+
+  const loadScope = useCallback(async (regionId: string, managerId: string) => {
+    try {
+      const params = new URLSearchParams();
+      if (regionId) params.set("region_id", regionId);
+      if (managerId) params.set("manager_id", managerId);
+      const qs = params.toString();
+      const data = await apiGet<{ managers?: OrgTreeManager[] }>(`/org-management/tree${qs ? `?${qs}` : ""}`);
+      const nextManagers = data?.managers || [];
+      setManagers(nextManagers);
+      const source = managerId
+        ? (nextManagers.find(m => String(m.id) === String(managerId))?.field_reps || [])
+        : nextManagers.flatMap(m => m.field_reps || []);
+      setReps(source.filter(rep => rep.is_active !== false && (!regionId || !rep.territory_id || String(rep.territory_id) === String(regionId))));
+      setError("");
+    } catch (e: any) {
+      setManagers([]);
+      setReps([]);
+      setError(e?.message || "Could not load assignment options.");
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoadingOptions(true);
+      try {
+        const regionResponse = await apiGet<{ regions?: OrgRegionOption[] }>("/org-management/regions");
+        if (cancelled) return;
+        const nextRegions = (regionResponse?.regions || []).filter(r => r?.id && r.is_active !== false);
+        setRegions(nextRegions);
+        const firstRegion = String(nextRegions[0]?.id || "");
+        const treeResponse = await apiGet<{ managers?: OrgTreeManager[] }>(`/org-management/tree${firstRegion ? `?region_id=${encodeURIComponent(firstRegion)}` : ""}`);
+        if (cancelled) return;
+        const nextManagers = treeResponse?.managers || [];
+        setManagers(nextManagers);
+        const managerIdForForm = isManager ? String(user?.id || "") : "";
+        const selectedManager = managerIdForForm ? nextManagers.find(m => String(m.id) === managerIdForForm) : null;
+        const source = selectedManager ? (selectedManager.field_reps || []) : nextManagers.flatMap(m => m.field_reps || []);
+        setReps(source.filter(rep => rep.is_active !== false && (!firstRegion || !rep.territory_id || String(rep.territory_id) === firstRegion)));
+        setForm(current => ({ ...current, territory_id: firstRegion, manager_id: managerIdForForm }));
+      } catch (e: any) {
+        if (!cancelled) setError(e?.message || "Could not load regions and team members.");
+      } finally {
+        if (!cancelled) setLoadingOptions(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isManager, user?.id]);
+
+  const setField = (key: keyof typeof form, value: string) => setForm(current => ({ ...current, [key]: value }));
+
+  async function handleRegionChange(regionId: string) {
+    setForm(current => ({ ...current, territory_id: regionId, manager_id: isManager ? String(user?.id || "") : "", assigned_to: "" }));
+    await loadScope(regionId, isManager ? String(user?.id || "") : "");
+  }
+
+  async function handleManagerChange(managerId: string) {
+    setForm(current => ({ ...current, manager_id: managerId, assigned_to: "" }));
+    await loadScope(form.territory_id, managerId);
+  }
+
+  const visibleManagers = managers.filter(m => m.is_active !== false);
+  const visibleReps = reps.length ? reps : (teamUsers || [])
+    .filter(member => String(member.role || "").toUpperCase() === "FIELD_REP" && member.is_active !== false)
+    .filter(member => isManager ? String(member.manager_id || "") === String(user?.id || "") : true)
+    .map(member => ({ id: member.id, full_name: member.full_name, email: member.email, is_active: member.is_active, manager_id: member.manager_id, territory_id: null, territory_name: null }));
+
+  async function createCustomer() {
+    const name = form.name.trim();
+    if (!name) return setError("Customer name is required.");
+    if (!form.territory_id) return setError("Select a region for this customer.");
+    if (isExecutive && form.assigned_to && !form.manager_id) return setError("Select the Field Rep's Manager first.");
+
+    setSaving(true);
+    setError("");
+    try {
+      const params = new URLSearchParams();
+      params.set("name", name);
+      params.set("territory_id", form.territory_id);
+      params.set("status_value", "ACTIVE");
+      const fields: Array<[string, string]> = [
+        ["contact_person", form.contact_person], ["email", form.email], ["phone", form.phone],
+        ["address", form.address], ["city", form.city], ["state", form.state], ["country", form.country],
+        ["industry", form.industry], ["notes", form.notes],
+      ];
+      for (const [key, value] of fields) if (value.trim()) params.set(key, value.trim());
+
+      const response = await fetch(`${API_BASE_URL}/customers/?${params.toString()}`, {
+        method: "POST",
+        headers: { Accept: "application/json", Authorization: `Bearer ${token()}` },
+      });
+      if (!response.ok) throw new Error(await apiError(response));
+      const data = await response.json();
+      const created = data?.customer || data;
+      if (!created?.id) throw new Error("Customer was created but no customer ID was returned.");
+
+      await apiPatch(`/org-management/customers/${encodeURIComponent(created.id)}/assignment`, {
+        territory_id: form.territory_id,
+        assigned_to: form.assigned_to || null,
+      });
+
+      onNotify?.(form.assigned_to ? `Customer ${name} created and assigned to the selected Field Rep.` : `Customer ${name} created successfully.`);
+      await onCreated?.();
+      onClose();
+    } catch (e: any) {
+      setError(e?.message || "Could not create the customer.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={e => { if (e.target === e.currentTarget && !saving) onClose(); }}>
+      <div className="success-modal" style={{ width: "min(860px, 94vw)", maxWidth: 860, textAlign: "left", padding: 24, maxHeight: "88vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+          <div><span className="eyebrow">CRM MANAGEMENT</span><h2 style={{ marginBottom: 4 }}>Create customer</h2><p style={{ margin: 0, color: "#8d808a", fontSize: 10 }}>Create the account, region, and Field Rep assignment together.</p></div>
+          <button className="icon-btn" type="button" onClick={onClose} disabled={saving}><X size={16} /></button>
+        </div>
+        {error && <div className="auth-error" style={{ marginTop: 14 }}><AlertTriangle size={14} /><span>{error}</span></div>}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0,1fr))", gap: 12, marginTop: 18 }}>
+          <label className="auth-field" style={{ gridColumn: "1 / -1" }}><span>Customer name *</span><input value={form.name} onChange={e => setField("name", e.target.value)} placeholder="e.g. Pune Industrial Solutions" /></label>
+          <label className="auth-field"><span>Contact person</span><input value={form.contact_person} onChange={e => setField("contact_person", e.target.value)} placeholder="Rahul Sharma" /></label>
+          <label className="auth-field"><span>Industry</span><input value={form.industry} onChange={e => setField("industry", e.target.value)} placeholder="Industrial Equipment" /></label>
+          <label className="auth-field"><span>Email</span><input type="email" value={form.email} onChange={e => setField("email", e.target.value)} placeholder="contact@company.com" /></label>
+          <label className="auth-field"><span>Phone</span><input value={form.phone} onChange={e => setField("phone", e.target.value)} placeholder="9876543210" /></label>
+          <label className="auth-field"><span>City</span><input value={form.city} onChange={e => setField("city", e.target.value)} placeholder="Pune" /></label>
+          <label className="auth-field"><span>State</span><input value={form.state} onChange={e => setField("state", e.target.value)} placeholder="Maharashtra" /></label>
+          <label className="auth-field" style={{ gridColumn: "1 / -1" }}><span>Address</span><input value={form.address} onChange={e => setField("address", e.target.value)} placeholder="Hinjewadi Phase 1, Pune" /></label>
+          <label className="auth-field"><span>Region *</span><select value={form.territory_id} onChange={e => void handleRegionChange(e.target.value)} disabled={loadingOptions || saving}><option value="">Select region</option>{regions.map(region => <option key={region.id} value={region.id}>{region.name}{region.city ? ` · ${region.city}` : ""}</option>)}</select></label>
+          {isExecutive ? <label className="auth-field"><span>Manager</span><select value={form.manager_id} onChange={e => void handleManagerChange(e.target.value)} disabled={loadingOptions || saving || !form.territory_id}><option value="">Unassigned manager</option>{visibleManagers.map(manager => <option key={manager.id} value={manager.id}>{manager.full_name}</option>)}</select></label> : <div className="auth-field"><span>Manager</span><div className="auth-note"><Users size={13} /><span>{user?.full_name || "Current Manager"}</span></div></div>}
+          <label className="auth-field" style={{ gridColumn: "1 / -1" }}><span>Assign Field Rep</span><select value={form.assigned_to} onChange={e => setField("assigned_to", e.target.value)} disabled={loadingOptions || saving || !form.territory_id}><option value="">Leave unassigned</option>{visibleReps.map(rep => <option key={rep.id} value={rep.id}>{rep.full_name}{rep.email ? ` · ${rep.email}` : ""}</option>)}</select></label>
+          <label className="auth-field" style={{ gridColumn: "1 / -1" }}><span>Notes</span><textarea rows={3} value={form.notes} onChange={e => setField("notes", e.target.value)} placeholder="Customer context and account notes…" style={{ resize: "vertical" }} /></label>
+        </div>
+        <div style={{ marginTop: 18, padding: 12, border: "1px solid rgba(184,59,104,.16)", borderRadius: 12 }}><div style={{ display: "flex", alignItems: "center", gap: 7 }}><ShieldCheck size={14} /><strong style={{ fontSize: 10 }}>Assignment scope</strong></div><p style={{ margin: "6px 0 0", color: "#8d808a", fontSize: 9, lineHeight: 1.5 }}>Manager: managed regions + own Field Rep team. Executive: organization-wide assignment.</p></div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}><button className="button ghost" type="button" onClick={onClose} disabled={saving}>Cancel</button><button className="button primary" type="button" onClick={() => void createCustomer()} disabled={saving || loadingOptions}>{saving ? <><Spinner size={13} /> Creating…</> : <><Plus size={14} /> Create customer</>}</button></div>
+      </div>
+    </div>
+  );
+}
 function CustomerDetailView({ selectedCustomerDetail, visits, reports, tasks, onGo, onStartVisit, canStartVisit = true }: any) {
   const c: ApiCustomer | null = selectedCustomerDetail;
   if (!c) { onGo("customers"); return null; }
@@ -3418,9 +4218,60 @@ function TasksView({ tasks, onUpdateTask, managerMode = false, teamUsers = [], c
 }
 
 // ─── ALERTS VIEW ──────────────────────────────────────────────────────────────
-function AlertsView({ alerts, onUpdateAlert }: any) {
+function AlertsView({
+  alerts = [],
+  onUpdateAlert,
+  user,
+  teamUsers = [],
+}: {
+  alerts?: ApiAlert[];
+  onUpdateAlert: (id: string, status: string) => void;
+  user?: AuthUser | null;
+  teamUsers?: ApiTeamUser[];
+}) {
+  const role = String(user?.role || "").toUpperCase();
+  const management = role === "MANAGER" || role === "EXECUTIVE";
   const [filter, setFilter] = useState("OPEN");
-  const filtered = alerts.filter((a: ApiAlert) => filter === "ALL" || a.status === filter);
+  const [regionFilter, setRegionFilter] = useState("ALL");
+  const [managerFilter, setManagerFilter] = useState("ALL");
+  const [repFilter, setRepFilter] = useState("ALL");
+
+  const regions = useMemo(() => {
+    const map = new Map<string, string>();
+    (alerts || []).forEach((a: any) => {
+      if (a.territory_id && a.region_name) map.set(String(a.territory_id), String(a.region_name));
+    });
+    (teamUsers || []).forEach(u => {
+      if (u.territory_id && u.territory_name) map.set(String(u.territory_id), String(u.territory_name));
+    });
+    return Array.from(map, ([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
+  }, [alerts, teamUsers]);
+
+  const managers = useMemo(() => {
+    const map = new Map<string, string>();
+    (alerts || []).forEach((a: any) => {
+      if (a.manager_id && a.manager_name) map.set(String(a.manager_id), String(a.manager_name));
+    });
+    (teamUsers || []).filter(u => String(u.role).toUpperCase() === "MANAGER").forEach(u => map.set(String(u.id), u.full_name));
+    return Array.from(map, ([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
+  }, [alerts, teamUsers]);
+
+  const reps = useMemo(() => {
+    return (teamUsers || [])
+      .filter(u => ["FIELD_REP", "SALESPERSON"].includes(String(u.role).toUpperCase()))
+      .filter(u => u.is_active !== false)
+      .filter(u => regionFilter === "ALL" || String(u.territory_id || "") === regionFilter)
+      .filter(u => managerFilter === "ALL" || String(u.manager_id || "") === managerFilter)
+      .sort((a, b) => a.full_name.localeCompare(b.full_name));
+  }, [teamUsers, regionFilter, managerFilter]);
+
+  const filtered = (alerts || []).filter((a: any) => {
+    if (filter !== "ALL" && String(a.status || "").toUpperCase() !== filter) return false;
+    if (regionFilter !== "ALL" && String(a.territory_id || "") !== regionFilter) return false;
+    if (managerFilter !== "ALL" && String(a.manager_id || "") !== managerFilter) return false;
+    if (repFilter !== "ALL" && String(a.rep_id || "") !== repFilter) return false;
+    return true;
+  });
 
   const severityClass = (severity: string) => {
     const value = String(severity || "").toUpperCase();
@@ -3438,6 +4289,14 @@ function AlertsView({ alerts, onUpdateAlert }: any) {
     return "open";
   };
 
+  useEffect(() => {
+    if (regionFilter !== "ALL" && managerFilter !== "ALL") {
+      const manager = (teamUsers || []).find(u => String(u.id) === managerFilter);
+      if (manager?.territory_id && String(manager.territory_id) !== regionFilter) setManagerFilter("ALL");
+    }
+    if (repFilter !== "ALL" && !reps.some(r => String(r.id) === repFilter)) setRepFilter("ALL");
+  }, [regionFilter, managerFilter, reps, repFilter, teamUsers]);
+
   return (
     <>
       <SectionHeader
@@ -3446,92 +4305,89 @@ function AlertsView({ alerts, onUpdateAlert }: any) {
         sub="AI-detected risks, opportunities, and urgent items from your field visits."
       />
 
+      {management && (
+        <div className="alert-org-filter-panel">
+          <div className="alert-org-filter-head">
+            <div>
+              <strong>Organizational view</strong>
+              <span>Filter alerts by region, manager, and Field Rep without leaving the alert workspace.</span>
+            </div>
+            <button type="button" className="button ghost" onClick={() => {
+              setRegionFilter("ALL"); setManagerFilter("ALL"); setRepFilter("ALL");
+            }}>
+              Clear filters
+            </button>
+          </div>
+          <div className="alert-org-filters">
+            <label><span>Region</span>
+              <select value={regionFilter} onChange={e => { setRegionFilter(e.target.value); setRepFilter("ALL"); }}>
+                <option value="ALL">All regions</option>
+                {regions.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+              </select>
+            </label>
+            <label><span>Manager</span>
+              <select value={managerFilter} onChange={e => { setManagerFilter(e.target.value); setRepFilter("ALL"); }}>
+                <option value="ALL">All managers</option>
+                {managers.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
+            </label>
+            <label><span>Field Rep</span>
+              <select value={repFilter} onChange={e => setRepFilter(e.target.value)}>
+                <option value="ALL">All Field Reps</option>
+                {reps.map(r => <option key={r.id} value={r.id}>{r.full_name}</option>)}
+              </select>
+            </label>
+          </div>
+        </div>
+      )}
+
       <div className="alert-filter-bar">
         <div className="alert-filter-tabs" role="tablist" aria-label="Alert status filter">
           {["ALL", "OPEN", "ACKNOWLEDGED", "RESOLVED"].map(f => (
-            <button
-              key={f}
-              type="button"
-              className={`alert-filter-tab ${filter === f ? "active" : ""}`}
-              onClick={() => setFilter(f)}
-            >
-              {f === "ALL" ? "All" : f === "IN_PROGRESS" ? "In progress" : f}
+            <button key={f} type="button" className={`alert-filter-tab ${filter === f ? "active" : ""}`} onClick={() => setFilter(f)}>
+              {f === "ALL" ? "All" : f}
             </button>
           ))}
         </div>
         <div className="alert-filter-summary">
           <span>{filtered.length}</span>
-          <small>{filter === "ALL" ? "total alerts" : `${filter.toLowerCase()} alerts`}</small>
+          <small>{filter === "ALL" ? "matching alerts" : `${filter.toLowerCase()} alerts`}</small>
         </div>
       </div>
 
       <div className="panel field-alerts-panel">
         {filtered.length === 0 ? (
-          <Empty text={filter === "ALL" ? "No field alerts yet." : `No ${filter.toLowerCase()} alerts.`} icon={Bell} />
+          <Empty text="No alerts match the current filters." icon={Bell} />
         ) : (
           <div className="field-alert-list">
-            {filtered.map((a: ApiAlert) => {
+            {filtered.map((a: any) => {
               const severity = severityClass(a.severity);
               const status = statusClass(a.status);
-
               return (
                 <article className={`field-alert-card ${severity}`} key={a.id}>
-                  <div className={`field-alert-icon ${severity}`}>
-                    <AlertTriangle size={18} />
-                  </div>
-
+                  <div className={`field-alert-icon ${severity}`}><AlertTriangle size={18} /></div>
                   <div className="field-alert-content">
                     <div className="field-alert-topline">
                       <div className="field-alert-labels">
                         <span className={`field-alert-severity ${severity}`}>{String(a.severity || "LOW").toUpperCase()}</span>
-                        {a.alert_type && (
-                          <span className="field-alert-type">
-                            {String(a.alert_type).replace(/_/g, " ")}
-                          </span>
-                        )}
+                        {a.alert_type && <span className="field-alert-type">{String(a.alert_type).replace(/_/g, " ")}</span>}
                       </div>
-                      <span className={`field-alert-status ${status}`}>
-                        <span className="field-alert-status-dot" />
-                        {String(a.status || "OPEN").replace(/_/g, " ")}
-                      </span>
+                      <span className={`field-alert-status ${status}`}><span className="field-alert-status-dot" />{String(a.status || "OPEN").replace(/_/g, " ")}</span>
                     </div>
-
                     <h3>{a.title || "Field sales alert"}</h3>
-
-                    <p className="field-alert-message">
-                      {a.message || "This alert was generated from a field activity."}
-                    </p>
-
+                    <p className="field-alert-message">{a.message || "This alert was generated from a field activity."}</p>
                     <div className="field-alert-meta">
-                      {a.customer_name && (
-                        <span>
-                          <Users size={12} />
-                          {a.customer_name}
-                        </span>
-                      )}
-                      {a.created_at && (
-                        <span>
-                          <Clock3 size={12} />
-                          {fmtDateTime(a.created_at)}
-                        </span>
-                      )}
+                      {a.customer_name && <span><Users size={12} />{a.customer_name}</span>}
+                      {a.region_name && <span><MapPin size={12} />{a.region_name}</span>}
+                      {a.manager_name && <span><Users size={12} />{a.manager_name}</span>}
+                      {a.rep_name && <span><CircleUserRound size={12} />{a.rep_name}</span>}
+                      {a.created_at && <span><Clock3 size={12} />{fmtDateTime(a.created_at)}</span>}
                     </div>
                   </div>
-
                   <div className="field-alert-actions">
-                    <label className="field-alert-status-label" htmlFor={`alert-status-${a.id}`}>
-                      Status
-                    </label>
-                    <select
-                      id={`alert-status-${a.id}`}
-                      className={`field-alert-status-select ${status}`}
-                      value={a.status}
-                      onChange={e => onUpdateAlert(a.id, e.target.value)}
-                    >
-                      <option value="OPEN">Open</option>
-                      <option value="ACKNOWLEDGED">Acknowledged</option>
-                      <option value="RESOLVED">Resolved</option>
-                      <option value="DISMISSED">Dismissed</option>
+                    <label className="field-alert-status-label" htmlFor={`alert-status-${a.id}`}>Status</label>
+                    <select id={`alert-status-${a.id}`} className={`field-alert-status-select ${status}`} value={a.status} onChange={e => onUpdateAlert(a.id, e.target.value)}>
+                      <option value="OPEN">Open</option><option value="ACKNOWLEDGED">Acknowledged</option><option value="RESOLVED">Resolved</option><option value="DISMISSED">Dismissed</option>
                     </select>
                   </div>
                 </article>
@@ -3667,44 +4523,46 @@ function HistoryView({ visits, reports, tasks, alerts, onGo }: any) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // MANAGER VIEWS
 // ═══════════════════════════════════════════════════════════════════════════════
-function ManagerViews({ view, dashboard, tasks, alerts, leads, customers, visits, reports, user, teamUsers, onGo, onUpdateTask, onUpdateAlert, onOpenCustomer, selectedCustomerDetail, onOpenRepActivity, onRefresh, onNotify }: any) {
-  if (view === "home") return <ManagerHome dashboard={dashboard} tasks={tasks} alerts={alerts} leads={leads} visits={visits} onGo={onGo} />;
-  if (view === "visits") return <ManagerVisits visits={visits} onGo={onGo} />;
-  if (view === "reports") return <ReportsListView reports={reports} user={user} onRefresh={onRefresh} onNotify={onNotify} onGo={onGo} />;
-  if (view === "customers") return <CustomersView customers={customers} onGo={onGo} onOpenCustomer={onOpenCustomer} canStartVisit={false} />;
-  if (view === "customer-detail") return <CustomerDetailView selectedCustomerDetail={selectedCustomerDetail} visits={visits} reports={reports} tasks={tasks} onGo={onGo} canStartVisit={false} />;
-  if (view === "tasks") return <TasksView tasks={tasks} onUpdateTask={onUpdateTask} managerMode={true} teamUsers={teamUsers} currentUser={user} />;
-  if (view === "alerts") return <AlertsView alerts={alerts} onUpdateAlert={onUpdateAlert} />;
+function ManagerViews(props: any) {
+  const { view } = props;
+  if (view === "home") return <ManagerHome {...props} />;
+  if (view === "visits") return <ManagementVisitsView {...props} />;
+  if (view === "record") return <RecordView {...props} />;
+  if (view === "report") return <ReportEditorView {...props} />;
+  if (view === "reports") return <ReportsListView {...props} />;
+  if (view === "customers") return <CustomersView {...props} canStartVisit={true} user={props.user} teamUsers={props.teamUsers} onRefresh={props.onRefresh} onNotify={props.onNotify} />;
+  if (view === "customer-detail") return <CustomerDetailView {...props} canStartVisit={true} />;
+  if (view === "history") return <ManagerHistoryView {...props} />;
+  if (view === "tasks") return <TasksView tasks={props.tasks} onUpdateTask={props.onUpdateTask} managerMode={true} teamUsers={props.teamUsers} currentUser={props.user} />;
+  if (view === "alerts") return <AlertsView alerts={props.alerts} onUpdateAlert={props.onUpdateAlert} user={props.user} teamUsers={props.teamUsers} />;
   if (view === "insights") return (
     <ManagerIntelligenceView
-      dashboard={dashboard}
-      teamUsers={teamUsers}
-      visits={visits}
-      reports={reports}
-      tasks={tasks}
-      alerts={alerts}
-      onGo={onGo}
-      onNotify={onNotify}
+      dashboard={props.dashboard}
+      teamUsers={props.teamUsers}
+      visits={props.visits}
+      reports={props.reports}
+      tasks={props.tasks}
+      alerts={props.alerts}
+      onGo={props.onGo}
+      onNotify={props.onNotify}
     />
   );
   if (view === "team") return (
     <TeamView
-      users={teamUsers}
-      visits={visits}
-      reports={reports}
-      dashboard={dashboard}
-      user={user}
-      onRefresh={onRefresh}
-      onNotify={onNotify}
-      onOpenActivity={onOpenRepActivity}
+      users={props.teamUsers}
+      visits={props.visits}
+      reports={props.reports}
+      dashboard={props.dashboard}
+      user={props.user}
+      onRefresh={props.onRefresh}
+      onNotify={props.onNotify}
+      onOpenActivity={props.onOpenRepActivity}
       executive={false}
     />
   );
-  if (view === "map") return <TerritoryView customers={customers} />;
-  // Shared views are rendered below the role-specific router. Do not let the
-  // role router fall back to the dashboard for those routes.
+  if (view === "map") return <TerritoryView customers={props.customers} />;
   if (view === "settings" || view === "email" || view === "rep-activity") return null;
-  return <ManagerHome dashboard={dashboard} tasks={tasks} alerts={alerts} leads={leads} visits={visits} onGo={onGo} />;
+  return <ManagerHome {...props} />;
 }
 
 function ManagerIntelligenceView({
@@ -3890,6 +4748,15 @@ function ManagerIntelligenceView({
     0
   );
 
+  const managerTeamPerformance = useMemo(() => rows.map((row: ManagerIntelligenceRow) => ({
+    rep: row.rep.full_name,
+    visits: Number(row.activity?.metrics?.visits ?? row.visits.length),
+    reports: Number(row.activity?.metrics?.reports ?? row.reports.length),
+  })), [rows]);
+  const managerActivityTrend = useMemo(() => buildSevenDayActivity(scopedVisits, scopedReports), [scopedVisits, scopedReports]);
+  const managerChart = getChartTheme();
+  const hasManagerTrend = managerActivityTrend.some(row => row.visits > 0 || row.reports > 0);
+
   return (
     <div className="manager-intelligence-page">
       <SectionHeader
@@ -3939,6 +4806,46 @@ function ManagerIntelligenceView({
           {lastUpdated && <span className="manager-intelligence-updated">Updated {fmtDateTime(lastUpdated.toISOString())}</span>}
         </div>
       </div>
+
+      {reps.length > 0 && (
+        <div className="fv-chart-grid manager-performance-charts">
+          <section className="panel fv-chart-panel">
+            <PanelTitle title="7-day team activity" icon={TrendingUp} />
+            {!hasManagerTrend ? <Empty text="No team visit or report trend data yet." icon={TrendingUp} /> : (
+              <div className="fv-chart-wrap">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={managerActivityTrend} margin={{ top: 5, right: 8, left: -8, bottom: 4 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={managerChart.grid} />
+                    <XAxis dataKey="day" tick={{ fill: managerChart.axis, fontSize: 9 }} axisLine={{ stroke: managerChart.grid }} tickLine={false} />
+                    <YAxis allowDecimals={false} tick={{ fill: managerChart.axis, fontSize: 9 }} axisLine={false} tickLine={false} />
+                    <Tooltip contentStyle={managerChart.tooltip} />
+                    <Legend wrapperStyle={{ color: managerChart.muted, fontSize: 9 }} />
+                    <Line type="monotone" dataKey="visits" name="Visits" stroke={COLORS[0]} strokeWidth={2} dot={{ r: 3 }} />
+                    <Line type="monotone" dataKey="reports" name="Reports" stroke={COLORS[4]} strokeWidth={2} dot={{ r: 3 }} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </section>
+
+          <section className="panel fv-chart-panel">
+            <PanelTitle title="Field Rep performance" icon={Users} />
+            <div className="fv-chart-wrap" style={{ height: Math.max(250, managerTeamPerformance.length * 38) }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={managerTeamPerformance} layout="vertical" margin={{ top: 5, right: 14, left: 8, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={managerChart.grid} />
+                  <XAxis type="number" allowDecimals={false} tick={{ fill: managerChart.axis, fontSize: 9 }} axisLine={{ stroke: managerChart.grid }} tickLine={false} />
+                  <YAxis type="category" dataKey="rep" width={96} tick={{ fill: managerChart.axis, fontSize: 8 }} axisLine={false} tickLine={false} />
+                  <Tooltip contentStyle={managerChart.tooltip} />
+                  <Legend wrapperStyle={{ color: managerChart.muted, fontSize: 9 }} />
+                  <Bar dataKey="visits" name="Visits" fill={COLORS[0]} radius={[0, 4, 4, 0]} />
+                  <Bar dataKey="reports" name="Reports" fill={COLORS[4]} radius={[0, 4, 4, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </section>
+        </div>
+      )}
 
       {reps.length === 0 ? (
         <div className="panel" style={{ marginTop: 14 }}>
@@ -4069,26 +4976,90 @@ function ManagerIntelligenceView({
   );
 }
 
-function ManagerHome({ dashboard, tasks, alerts, leads, visits, onGo }: any) {
+function ManagerHome({ dashboard, tasks, alerts, leads, visits = [], user, onGo }: any) {
+  const ownVisits = visits.filter((v: ApiVisit) => String(v.user_id) === String(user?.id));
+  const myTodayVisits = ownVisits.filter((v: ApiVisit) => new Date(v.visit_date).toDateString() === new Date().toDateString()).length;
+  const myPendingApproval = ownVisits.filter((v: ApiVisit) => String(v.approval_status || "").toUpperCase() === "PENDING").length;
+  const myApprovedVisits = ownVisits.filter((v: ApiVisit) => String(v.approval_status || "").toUpperCase() === "APPROVED").length;
+  const openAlerts = alerts.filter((a: any) => a.status === "OPEN").length;
+  const pendingTasks = tasks.filter((t: any) => t.status === "PENDING").length;
+
   return (
     <>
-      <SectionHeader eyebrow="MANAGER DASHBOARD" title="Team intelligence" sub="Real-time field intelligence from your team's visits, reports, and AI analysis." />
+      <SectionHeader
+        eyebrow="MANAGER WORKSPACE"
+        title={`Good ${new Date().getHours() < 12 ? "morning" : new Date().getHours() < 17 ? "afternoon" : "evening"}, ${user?.full_name?.split(" ")[0] || "Manager"}.`}
+        sub="Run your own customer sales activity while managing your Field Rep team."
+        action={
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="button ghost" onClick={() => onGo("customers")}><Plus size={14} /> New Customer</button>
+            <button className="button primary" onClick={() => onGo("record")}><Mic size={14} /> New Visit</button>
+          </div>
+        }
+      />
+
       <div className="metric-grid">
-        <Metric icon={MapPin} label="Team visits" value={dashboard?.overview.total_visits ?? 0} sub="Total visits" />
-        <Metric icon={Users} label="Customers" value={dashboard?.overview.total_customers ?? 0} sub="Accounts" />
-        <Metric icon={Target} label="Pipeline" value={money(dashboard?.overview.pipeline_value)} sub="Open value" tone="amber" />
-        <Metric icon={Bell} label="Open alerts" value={dashboard?.overview.open_alerts ?? 0} sub="Needs attention" tone="red" />
+        <div className="metric-card" style={{ cursor: "pointer" }} onClick={() => onGo("record")}>
+          <div className="metric-top"><Mic size={18} /><span>My visits today</span></div>
+          <strong className="metric-value">{myTodayVisits}</strong>
+          <span className="metric-sub">Start another visit</span>
+        </div>
+        <div className="metric-card" style={{ cursor: "pointer" }} onClick={() => onGo("visits")}>
+          <div className="metric-top"><MapPin size={18} /><span>Team visits</span></div>
+          <strong className="metric-value">{dashboard?.overview.total_visits ?? 0}</strong>
+          <span className="metric-sub">Team + your field activity</span>
+        </div>
+        <div className="metric-card amber" style={{ cursor: "pointer" }} onClick={() => onGo("history")}>
+          <div className="metric-top"><Clock3 size={18} /><span>Awaiting Executive</span></div>
+          <strong className="metric-value">{myPendingApproval}</strong>
+          <span className="metric-sub">Your completed visits pending approval</span>
+        </div>
+        <div className="metric-card" style={{ cursor: "pointer" }} onClick={() => onGo("history")}>
+          <div className="metric-top"><CheckCircle2 size={18} /><span>Approved visits</span></div>
+          <strong className="metric-value">{myApprovedVisits}</strong>
+          <span className="metric-sub">Executive-approved activity</span>
+        </div>
       </div>
+
       <div className="grid-2">
         <div className="panel">
-          <PanelTitle title="Recent team visits" icon={Activity} action={<button className="text-button" onClick={() => onGo("visits")}>View all <ArrowUpRight size={12} /></button>} />
-          <RecentVisits dashboard={dashboard} />
+          <PanelTitle title="My recent visits" icon={Mic} action={<button className="text-button" onClick={() => onGo("history")}>View history <ArrowUpRight size={12} /></button>} />
+          {ownVisits.length === 0 ? <Empty text="You have not created a visit yet." icon={MapPin} /> : (
+            <div className="activity-list">
+              {ownVisits
+                .slice()
+                .sort((a: ApiVisit, b: ApiVisit) => new Date(b.visit_date).getTime() - new Date(a.visit_date).getTime())
+                .slice(0, 6)
+                .map((v: ApiVisit) => {
+                  const approval = String(v.approval_status || "NOT_REQUIRED").toUpperCase();
+                  return (
+                    <div className="activity-item" key={v.id}>
+                      <div className={`activity-dot ${String(v.status).toLowerCase()}`} />
+                      <div className="activity-body">
+                        <strong>{v.customer_name}</strong>
+                        <span>{fmtDateTime(v.visit_date)} · {String(v.status || "").replace(/_/g, " ")}</span>
+                      </div>
+                      <div className="activity-meta">
+                        <Badge label={approval.replace(/_/g, " ")} type={approval === "APPROVED" ? "success" : approval === "REJECTED" ? "error" : approval === "PENDING" ? "pending" : "active"} />
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
+          )}
         </div>
+
         <div className="panel">
-          <PanelTitle title="Pipeline distribution" icon={Target} />
-          <PipelineBar pipeline={dashboard?.pipeline || []} />
+          <PanelTitle title="Team snapshot" icon={Users} action={<button className="text-button" onClick={() => onGo("team")}>Manage team <ArrowUpRight size={12} /></button>} />
+          <div className="settings-list">
+            <div><span>Team visits</span><strong>{dashboard?.overview.total_visits ?? 0}</strong></div>
+            <div><span>Customers</span><strong>{dashboard?.overview.total_customers ?? 0}</strong></div>
+            <div><span>Pending action items</span><strong>{pendingTasks}</strong></div>
+            <div><span>Open alerts</span><strong>{openAlerts}</strong></div>
+          </div>
         </div>
       </div>
+
       <div className="grid-2" style={{ marginTop: 8 }}>
         <div className="panel">
           <PanelTitle title="Pending action items" icon={ClipboardCheck} action={<button className="text-button" onClick={() => onGo("tasks")}>View all <ArrowUpRight size={12} /></button>} />
@@ -4118,32 +5089,332 @@ function ManagerHome({ dashboard, tasks, alerts, leads, visits, onGo }: any) {
   );
 }
 
-function ManagerVisits({ visits, onGo }: any) {
-  const [filter, setFilter] = useState("ALL");
-  const filtered = visits.filter((v: ApiVisit) => filter === "ALL" || v.status === filter);
+
+function ManagerHistoryView({ visits = [], reports = [], tasks = [], alerts = [], user, onGo, onNotify, onRefresh }: any) {
+  const [tab, setTab] = useState<"visits" | "reports" | "tasks" | "alerts">("visits");
+  const [search, setSearch] = useState("");
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
+
+  const ownVisits = visits.filter((v: ApiVisit) => String(v.user_id) === String(user?.id));
+  const ownReports = reports.filter((r: ApiReport) => String(r.created_by || "") === String(user?.id));
+  const filteredVisits = ownVisits.filter((v: ApiVisit) =>
+    (v.customer_name || "").toLowerCase().includes(search.toLowerCase()) ||
+    String(v.status || "").toLowerCase().includes(search.toLowerCase()) ||
+    String(v.approval_status || "").toLowerCase().includes(search.toLowerCase())
+  );
+  const filteredReports = ownReports.filter((r: ApiReport) =>
+    (r.customer_name || "").toLowerCase().includes(search.toLowerCase()) ||
+    String(r.status || "").toLowerCase().includes(search.toLowerCase())
+  );
+  const filteredTasks = tasks.filter((t: ApiActionItem) =>
+    t.title.toLowerCase().includes(search.toLowerCase()) ||
+    (t.customer_name || "").toLowerCase().includes(search.toLowerCase())
+  );
+  const filteredAlerts = alerts.filter((a: ApiAlert) =>
+    a.title.toLowerCase().includes(search.toLowerCase()) ||
+    a.message.toLowerCase().includes(search.toLowerCase())
+  );
+
+  async function resubmitVisit(v: ApiVisit) {
+    setActionBusy(v.id);
+    try {
+      await apiPost(`/visits/${v.id}/resubmit`);
+      onNotify?.("Visit resubmitted to Executive for approval.");
+      await onRefresh?.();
+    } catch (e: any) {
+      onNotify?.(e?.message || "Could not resubmit visit.");
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
   return (
     <>
-      <SectionHeader eyebrow="TEAM VISITS" title="All team visits" sub="Monitor your team's field visit activity." />
+      <SectionHeader
+        eyebrow="MY HISTORY"
+        title="Your sales history"
+        sub="Your visits, voice reports, tasks, alerts, and Executive approval status in one place."
+        action={<button className="button primary" onClick={() => onGo("record")}><Mic size={14} /> New Visit</button>}
+      />
+
       <div className="filter-row">
-        {["ALL", "IN_PROGRESS", "COMPLETED"].map(f => (
-          <button key={f} className={`pill ${filter === f ? "active-pill" : ""}`} onClick={() => setFilter(f)}>{f === "ALL" ? "All" : f.replace("_", " ")}</button>
+        <div className="search-box" style={{ flex: 1 }}><Search size={14} /><input placeholder="Search your history…" value={search} onChange={e => setSearch(e.target.value)} /></div>
+        {(["visits", "reports", "tasks", "alerts"] as const).map(t => (
+          <button key={t} className={`pill ${tab === t ? "active-pill" : ""}`} onClick={() => setTab(t)}>{t.charAt(0).toUpperCase() + t.slice(1)}</button>
         ))}
       </div>
+
       <div className="panel" style={{ marginTop: 14 }}>
-        {filtered.length === 0 ? <Empty text="No visits." icon={MapPin} /> : (
-          <div className="table-list">
-            <div className="table-header"><span>Customer</span><span>Sales Rep</span><span>Date</span><span>Status</span></div>
-            {filtered.map((v: ApiVisit) => (
-              <div className="table-row" key={v.id}>
-                <strong>{v.customer_name}</strong>
-                <span style={{ fontSize: 10 }}>{v.user_name}</span>
-                <span style={{ fontSize: 9 }}>{fmtDateTime(v.visit_date)}</span>
-                <Badge label={v.status.replace("_", " ")} type={v.status === "COMPLETED" ? "success" : "active"} />
+        {tab === "visits" && (
+          <>
+            <PanelTitle title={`My Visits (${filteredVisits.length})`} icon={MapPin} />
+            {filteredVisits.length === 0 ? <Empty text="No visits found." icon={MapPin} /> : (
+              <div className="table-list" style={{ marginTop: 10 }}>
+                <div className="table-header manager-history-header"><span>Customer</span><span>Date</span><span>Visit status</span><span>Approval</span><span>Action</span></div>
+                {filteredVisits.map((v: ApiVisit) => {
+                  const approval = String(v.approval_status || "NOT_REQUIRED").toUpperCase();
+                  return (
+                    <div className="table-row manager-history-row" key={v.id}>
+                      <div><strong>{v.customer_name}</strong><span style={{ fontSize: 8, color: "#6d5963" }}>{v.visit_type}</span></div>
+                      <span style={{ fontSize: 9 }}>{fmtDateTime(v.visit_date)}</span>
+                      <Badge label={String(v.status || "").replace(/_/g, " ")} type={String(v.status).toUpperCase() === "COMPLETED" ? "success" : "active"} />
+                      <div className="manager-history-approval">
+                        <Badge label={approval.replace(/_/g, " ")} type={approval === "APPROVED" ? "success" : approval === "REJECTED" ? "error" : approval === "PENDING" ? "pending" : "active"} />
+                        {approval === "REJECTED" && v.rejection_reason && <span className="manager-rejection-reason" title={v.rejection_reason}>{v.rejection_reason}</span>}
+                      </div>
+                      {approval === "REJECTED" ? (
+                        <button className="button compact" disabled={actionBusy === v.id} onClick={() => resubmitVisit(v)}>{actionBusy === v.id ? "Resubmitting…" : "Resubmit"}</button>
+                      ) : approval === "APPROVED" ? (
+                        <span style={{ fontSize: 8, color: "#6d5963" }}>{v.approved_by_name ? `Approved by ${v.approved_by_name}` : "Approved"}</span>
+                      ) : approval === "PENDING" ? (
+                        <span style={{ fontSize: 8, color: "#8d808a" }}>Awaiting Executive</span>
+                      ) : <span>—</span>}
+                    </div>
+                  );
+                })}
               </div>
-            ))}
+            )}
+          </>
+        )}
+
+        {tab === "reports" && (
+          <>
+            <PanelTitle title={`My Reports (${filteredReports.length})`} icon={FileText} />
+            {filteredReports.length === 0 ? <Empty text="No reports found." icon={FileText} /> : (
+              <div className="table-list" style={{ marginTop: 10 }}>
+                <div className="table-header"><span>Customer</span><span>Status</span><span>Submitted</span><span>Report</span></div>
+                {filteredReports.map((r: ApiReport) => (
+                  <div className="table-row" key={r.id}>
+                    <div><strong>{r.customer_name || "Unknown"}</strong><span style={{ fontSize: 8, color: "#6d5963" }}>{r.title}</span></div>
+                    <Badge label={r.status} type={r.status === "SUBMITTED" || r.status === "APPROVED" ? "success" : r.status === "REJECTED" ? "error" : "pending"} />
+                    <span style={{ fontSize: 9 }}>{r.submitted_at ? fmtDate(r.submitted_at) : "—"}</span>
+                    <span style={{ fontSize: 9 }}>{r.created_by_name || user?.full_name}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {tab === "tasks" && (
+          <>
+            <PanelTitle title={`Action Items (${filteredTasks.length})`} icon={ClipboardCheck} />
+            {filteredTasks.length === 0 ? <Empty text="No action items found." icon={ClipboardCheck} /> : (
+              <div className="activity-list" style={{ marginTop: 10 }}>
+                {filteredTasks.map((t: ApiActionItem) => (
+                  <div className="activity-item" key={t.id}><div className={`activity-dot ${t.priority?.toLowerCase()}`} /><div className="activity-body"><strong>{t.title}</strong><span>{t.customer_name || "—"}</span></div><Badge label={t.status} /></div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {tab === "alerts" && (
+          <>
+            <PanelTitle title={`Alerts (${filteredAlerts.length})`} icon={Bell} />
+            {filteredAlerts.length === 0 ? <Empty text="No alerts found." icon={Bell} /> : (
+              <div className="activity-list" style={{ marginTop: 10 }}>
+                {filteredAlerts.map((a: ApiAlert) => (
+                  <div className="activity-item" key={a.id}><AlertTriangle size={13} style={{ color: "#e05a7a" }} /><div className="activity-body"><strong>{a.title}</strong><span>{a.customer_name || "—"} · {a.severity}</span></div><Badge label={a.status} /></div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </>
+  );
+}
+
+function ManagementVisitsView({ visits, user, onGo, onRefresh, onNotify }: any) {
+  const isExecutive = String(user?.role || "").toUpperCase() === "EXECUTIVE";
+  const isManager = String(user?.role || "").toUpperCase() === "MANAGER";
+  const [orgFilteredVisits, setOrgFilteredVisits] = useState<ApiVisit[]>(visits);
+  const [orgLoading, setOrgLoading] = useState(false);
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const [rejectTarget, setRejectTarget] = useState<ApiVisit | null>(null);
+  const [rejectReason, setRejectReason] = useState("");
+
+  const loadOrgVisits = useCallback(async (nextFilters: OrgFilterState) => {
+    if (!isExecutive && !isManager) return;
+    setOrgLoading(true);
+    try {
+      const qs = toFilterQuery(nextFilters, "visit_date");
+      const response = await apiGet<{ visits?: ApiVisit[] }>(`/visits/${qs ? `?${qs}` : ""}`);
+      setOrgFilteredVisits(response?.visits || []);
+    } catch (e: any) {
+      console.error("Filtered visit load failed:", e);
+      onNotify?.(e?.message || "Could not load visits.");
+    } finally {
+      setOrgLoading(false);
+    }
+  }, [isExecutive, isManager, onNotify]);
+
+  useEffect(() => {
+    if (!isExecutive && !isManager) {
+      setOrgFilteredVisits(visits);
+      return;
+    }
+    if (!orgLoading) setOrgFilteredVisits(prev => prev.length ? prev : visits);
+  }, [visits, isExecutive, isManager]);
+
+  async function reloadAfterApproval() {
+    await onRefresh?.();
+    if (isExecutive || isManager) {
+      // Re-apply the current visible scope after the global refresh by using the current list.
+      setOrgFilteredVisits(current => current.map(v => v));
+    }
+  }
+
+  async function approveVisit(visit: ApiVisit) {
+    setActionBusy(visit.id);
+    try {
+      await apiPost(`/visits/${visit.id}/approve`);
+      onNotify?.(`Visit approved for ${visit.user_name || "Manager"}.`);
+      await onRefresh?.();
+      setOrgFilteredVisits(prev => prev.map(v => v.id === visit.id ? { ...v, approval_status: "APPROVED" } : v));
+    } catch (e: any) {
+      onNotify?.(e?.message || "Visit approval failed.");
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
+  async function rejectVisit() {
+    if (!rejectTarget || !rejectReason.trim()) return;
+    const targetId = rejectTarget.id;
+    setActionBusy(targetId);
+    try {
+      await apiPost(`/visits/${targetId}/reject`, { rejection_reason: rejectReason.trim() });
+      onNotify?.("Visit rejected. The Manager can edit the visit and resubmit it.");
+      setRejectTarget(null);
+      setRejectReason("");
+      await onRefresh?.();
+      setOrgFilteredVisits(prev => prev.map(v => v.id === targetId ? { ...v, approval_status: "REJECTED", rejection_reason: rejectReason.trim() } : v));
+    } catch (e: any) {
+      onNotify?.(e?.message || "Visit rejection failed.");
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
+  async function resubmitVisit(visit: ApiVisit) {
+    setActionBusy(visit.id);
+    try {
+      await apiPost(`/visits/${visit.id}/resubmit`);
+      onNotify?.("Visit resubmitted to Executive for approval.");
+      await onRefresh?.();
+      setOrgFilteredVisits(prev => prev.map(v => v.id === visit.id ? { ...v, approval_status: "PENDING", rejection_reason: null, rejected_at: null } : v));
+    } catch (e: any) {
+      onNotify?.(e?.message || "Visit resubmission failed.");
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
+  const pendingManagerApprovals = orgFilteredVisits.filter(
+    v => isExecutive && String(v.user_role || "").toUpperCase() === "MANAGER" && String(v.approval_status || "").toUpperCase() === "PENDING"
+  ).length;
+
+  return (
+    <>
+      <SectionHeader
+        eyebrow={isExecutive ? "EXECUTIVE VISIT APPROVAL" : "TEAM VISITS"}
+        title={isExecutive ? "Organization visits" : "All team visits"}
+        sub={isExecutive ? "Review Manager-owned visits and approve or reject completed activity." : "Monitor your team's visits and your own sales visits, with Executive approval status shown separately."}
+        action={isManager ? <button className="button primary" onClick={() => onGo("record")}><Mic size={14} /> New Visit</button> : undefined}
+      />
+
+      {isExecutive && pendingManagerApprovals > 0 && (
+        <div className="manager-approval-banner">
+          <Clock3 size={16} />
+          <div><strong>{pendingManagerApprovals} Manager visit{pendingManagerApprovals === 1 ? "" : "s"} waiting for approval</strong><span>These visits are completed and require Executive review.</span></div>
+        </div>
+      )}
+
+      <ManagementFilterBar
+        user={user}
+        statusOptions={["IN_PROGRESS", "COMPLETED", "CANCELLED"]}
+        onChange={loadOrgVisits}
+      />
+
+      <div className="panel" style={{ marginTop: 14 }}>
+        {orgLoading ? (
+          <div className="empty"><Spinner size={18} /><span>Loading filtered visits…</span></div>
+        ) : orgFilteredVisits.length === 0 ? (
+          <Empty text="No visits found for the selected scope." icon={MapPin} />
+        ) : (
+          <div className="table-list">
+            <div className="table-header management-visits-header management-visits-header-approval">
+              <span>Customer</span>
+              <span>Field Rep / Manager</span>
+              <span>Manager</span>
+              <span>Region</span>
+              <span>Date</span>
+              <span>Status</span>
+              <span>Approval</span>
+            </div>
+            {orgFilteredVisits.map((v: ApiVisit) => {
+              const approval = String(v.approval_status || "NOT_REQUIRED").toUpperCase();
+              const isManagerVisit = String(v.user_role || "").toUpperCase() === "MANAGER";
+              const canApprove = isExecutive && isManagerVisit && approval === "PENDING";
+              const canResubmit = isManager && String(v.user_id) === String(user?.id) && approval === "REJECTED";
+              return (
+                <div className="table-row management-visit-row management-visit-row-approval" key={v.id}>
+                  <div>
+                    <strong>{v.customer_name}</strong>
+                    <span style={{ fontSize: 9, color: "#6d5963" }}>{v.visit_type}</span>
+                  </div>
+                  <span style={{ fontSize: 10 }}>{v.user_name || "—"}</span>
+                  <span style={{ fontSize: 9, color: "#8b7b86" }}>{v.manager_name || (isManagerVisit ? v.user_name : "—")}</span>
+                  <span style={{ fontSize: 9, color: "#8b7b86" }}>{v.region_name || "—"}</span>
+                  <span style={{ fontSize: 9 }}>{fmtDateTime(v.visit_date)}</span>
+                  <Badge label={String(v.status || "").replace(/_/g, " ")} type={String(v.status).toUpperCase() === "COMPLETED" ? "success" : String(v.status).toUpperCase() === "IN_PROGRESS" ? "active" : "pending"} />
+                  <div className="manager-visit-approval-cell">
+                    <Badge label={approval.replace(/_/g, " ")} type={approval === "APPROVED" ? "success" : approval === "REJECTED" ? "error" : approval === "PENDING" ? "pending" : "active"} />
+                    {v.rejection_reason && approval === "REJECTED" && <span className="manager-rejection-reason" title={v.rejection_reason}>{v.rejection_reason}</span>}
+                    {canApprove && (
+                      <div className="manager-approval-actions">
+                        <button className="button primary compact" disabled={actionBusy === v.id} onClick={() => approveVisit(v)}>{actionBusy === v.id ? "…" : "Approve"}</button>
+                        <button className="button compact danger-button" disabled={actionBusy === v.id} onClick={() => { setRejectTarget(v); setRejectReason(""); }}>Reject</button>
+                      </div>
+                    )}
+                    {canResubmit && (
+                      <button className="button compact" disabled={actionBusy === v.id} onClick={() => resubmitVisit(v)}>
+                        {actionBusy === v.id ? "Resubmitting…" : "Resubmit"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
       </div>
+
+      {rejectTarget && (
+        <div className="modal-backdrop" onClick={e => { if (e.target === e.currentTarget && !actionBusy) setRejectTarget(null); }}>
+          <div className="success-modal manager-reject-visit-modal">
+            <div className="success-icon error-icon"><XCircle size={28} /></div>
+            <h2>Reject Manager Visit</h2>
+            <p>Give the Manager a reason so the visit can be corrected and resubmitted.</p>
+            <textarea
+              className="manager-rejection-textarea"
+              value={rejectReason}
+              onChange={e => setRejectReason(e.target.value)}
+              placeholder="Reason for rejection…"
+              rows={5}
+              maxLength={2000}
+              autoFocus
+            />
+            <div className="manager-reject-counter">{rejectReason.length}/2000</div>
+            <div className="modal-actions">
+              <button className="button" disabled={!!actionBusy} onClick={() => setRejectTarget(null)}>Cancel</button>
+              <button className="button danger-button" disabled={!!actionBusy || !rejectReason.trim()} onClick={rejectVisit}>{actionBusy ? "Rejecting…" : "Reject Visit"}</button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -4203,15 +5474,22 @@ function LeadsView({ leads, customers, onGo }: any) {
 }
 
 // ─── AI INSIGHTS VIEW ─────────────────────────────────────────────────────────
-function InsightsView({ dashboard, alerts }: any) {
+function InsightsView({ dashboard, alerts, tasks = [], visits = [], reports = [] }: any) {
+  const chart = getChartTheme();
+  const signalLevels = useMemo(() => buildHighSignalData(Number(dashboard?.overview?.high_opportunities || 0), Number(dashboard?.overview?.high_risks || 0)), [dashboard]);
+  const activityTrend = useMemo(() => buildSevenDayActivity(visits as ApiVisit[], reports as ApiReport[]), [visits, reports]);
+  const taskStatus = useMemo(() => buildTaskStatusData(tasks as ApiActionItem[]), [tasks]);
+  const reportStatus = useMemo(() => buildReportStatusData(reports as ApiReport[]), [reports]);
+  const hasActivity = activityTrend.some(row => row.visits > 0 || row.reports > 0);
+
   return (
     <>
-      <SectionHeader eyebrow="AI INTELLIGENCE" title="Field intelligence insights" sub="Aggregated AI signals from all field visits and voice notes." />
+      <SectionHeader eyebrow="AI INTELLIGENCE" title="Field intelligence insights" sub="Aggregated AI signals from field visits and voice notes." />
       <div className="metric-grid">
         <Metric icon={Zap} label="High opportunities" value={dashboard?.overview.high_opportunities ?? 0} sub="From AI analysis" tone="green" />
         <Metric icon={AlertTriangle} label="High risks" value={dashboard?.overview.high_risks ?? 0} sub="Needs attention" tone="red" />
         <Metric icon={Bell} label="Open alerts" value={dashboard?.overview.open_alerts ?? 0} sub="Unresolved" tone="amber" />
-        <Metric icon={Activity} label="Total visits" value={dashboard?.overview.total_visits ?? 0} sub="Organization-wide" />
+        <Metric icon={Activity} label="Total visits" value={dashboard?.overview.total_visits ?? 0} sub="Current scope" />
       </div>
 
       <div className="grid-2">
@@ -4224,7 +5502,7 @@ function InsightsView({ dashboard, alerts }: any) {
                   cx="50%" cy="50%" outerRadius={75} dataKey="value" label={({ name, value }) => `${name}: ${value}`}>
                   {dashboard.sentiment.map((_: any, i: number) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
                 </Pie>
-                <Tooltip contentStyle={{ background: "#1a1018", border: "1px solid #38272f", borderRadius: 8 }} />
+                <Tooltip contentStyle={chart.tooltip} />
               </PieChart>
             </ResponsiveContainer>
           ) : <Empty text="No sentiment data yet." />}
@@ -4239,6 +5517,79 @@ function InsightsView({ dashboard, alerts }: any) {
             </div>
           ))}
         </div>
+      </div>
+
+      <div className="fv-chart-grid">
+        <section className="panel fv-chart-panel">
+          <PanelTitle title="AI signal levels" icon={Sparkles} />
+          {signalLevels.length === 0 ? <Empty text="No opportunity or risk level data yet." icon={Sparkles} /> : (
+            <div className="fv-chart-wrap">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={signalLevels} margin={{ top: 5, right: 8, left: -8, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={chart.grid} />
+                  <XAxis dataKey="signal" tick={{ fill: chart.axis, fontSize: 8 }} axisLine={{ stroke: chart.grid }} tickLine={false} />
+                  <YAxis allowDecimals={false} tick={{ fill: chart.axis, fontSize: 9 }} axisLine={false} tickLine={false} />
+                  <Tooltip contentStyle={chart.tooltip} />
+                  <Legend wrapperStyle={{ color: chart.muted, fontSize: 9 }} />
+                  <Bar dataKey="count" name="High signals" fill={COLORS[0]} radius={[4, 4, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </section>
+
+        <section className="panel fv-chart-panel">
+          <PanelTitle title="7-day field activity" icon={TrendingUp} />
+          {!hasActivity ? <Empty text="No visit or report trend data yet." icon={TrendingUp} /> : (
+            <div className="fv-chart-wrap">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={activityTrend} margin={{ top: 5, right: 8, left: -8, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={chart.grid} />
+                  <XAxis dataKey="day" tick={{ fill: chart.axis, fontSize: 9 }} axisLine={{ stroke: chart.grid }} tickLine={false} />
+                  <YAxis allowDecimals={false} tick={{ fill: chart.axis, fontSize: 9 }} axisLine={false} tickLine={false} />
+                  <Tooltip contentStyle={chart.tooltip} />
+                  <Legend wrapperStyle={{ color: chart.muted, fontSize: 9 }} />
+                  <Line type="monotone" dataKey="visits" name="Visits" stroke={COLORS[0]} strokeWidth={2} dot={{ r: 3 }} />
+                  <Line type="monotone" dataKey="reports" name="Reports" stroke={COLORS[4]} strokeWidth={2} dot={{ r: 3 }} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </section>
+
+        <section className="panel fv-chart-panel">
+          <PanelTitle title="Action item workload" icon={ClipboardCheck} />
+          {taskStatus.length === 0 ? <Empty text="No action items yet." icon={ClipboardCheck} /> : (
+            <div className="fv-chart-wrap">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={taskStatus} layout="vertical" margin={{ top: 5, right: 14, left: 6, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={chart.grid} />
+                  <XAxis type="number" allowDecimals={false} tick={{ fill: chart.axis, fontSize: 9 }} axisLine={{ stroke: chart.grid }} tickLine={false} />
+                  <YAxis type="category" dataKey="status" width={82} tick={{ fill: chart.axis, fontSize: 8 }} axisLine={false} tickLine={false} />
+                  <Tooltip contentStyle={chart.tooltip} />
+                  <Bar dataKey="count" name="Action items" fill={COLORS[1]} radius={[0, 4, 4, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </section>
+
+        <section className="panel fv-chart-panel">
+          <PanelTitle title="Report workflow" icon={FileText} />
+          {reportStatus.length === 0 ? <Empty text="No reports yet." icon={FileText} /> : (
+            <div className="fv-chart-wrap">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={reportStatus} margin={{ top: 5, right: 8, left: -8, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={chart.grid} />
+                  <XAxis dataKey="status" tick={{ fill: chart.axis, fontSize: 7 }} axisLine={{ stroke: chart.grid }} tickLine={false } />
+                  <YAxis allowDecimals={false} tick={{ fill: chart.axis, fontSize: 9 }} axisLine={false} tickLine={false} />
+                  <Tooltip contentStyle={chart.tooltip} />
+                  <Bar dataKey="count" name="Reports" fill={COLORS[4]} radius={[4, 4, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </section>
       </div>
     </>
   );
@@ -4360,6 +5711,31 @@ function ExecutiveOrganizationIntelligenceView({
   }, [managers, selectedManagerId]);
 
   const visibleReps = useMemo(() => visibleManagers.flatMap(m => m.field_reps || []), [visibleManagers]);
+
+  const managerOwnActivity = useMemo(() => visibleManagers.map((manager: TreeManager) => ({
+    manager: manager.full_name,
+    visits: visits.filter(v => String(v.user_id) === String(manager.id)).length,
+    reports: reports.filter(r => String(r.created_by || "") === String(manager.id)).length,
+  })), [visibleManagers, visits, reports]);
+
+  const managerTeamActivity = useMemo(() => visibleManagers.map((manager: TreeManager) => {
+    const repIds = new Set((manager.field_reps || []).map(rep => String(rep.id)));
+    return {
+      manager: manager.full_name,
+      visits: visits.filter(v => repIds.has(String(v.user_id))).length,
+      reports: reports.filter(r => repIds.has(String(r.created_by || ""))).length,
+    };
+  }), [visibleManagers, visits, reports]);
+
+  const selectedManagerComparison = useMemo(() => {
+    if (!selectedManager) return [];
+    const repIds = new Set((selectedManager.field_reps || []).map(rep => String(rep.id)));
+    return [
+      { scope: "Manager", visits: visits.filter(v => String(v.user_id) === String(selectedManager.id)).length, reports: reports.filter(r => String(r.created_by || "") === String(selectedManager.id)).length },
+      { scope: "Field Rep team", visits: visits.filter(v => repIds.has(String(v.user_id))).length, reports: reports.filter(r => repIds.has(String(r.created_by || ""))).length },
+    ];
+  }, [selectedManager, visits, reports]);
+  const executiveChart = getChartTheme();
 
   async function loadOrganization(regionId = selectedRegionId, managerId = selectedManagerId, searchValue = appliedSearch) {
     setLoadingOrg(true);
@@ -4680,6 +6056,44 @@ function ExecutiveOrganizationIntelligenceView({
         </section>
       </div>
 
+      {visibleManagers.length > 0 && (
+        <div className="fv-chart-grid executive-manager-charts">
+          <section className="panel fv-chart-panel">
+            <PanelTitle title="Manager individual performance" icon={Users} />
+            <div className="fv-chart-wrap" style={{ height: Math.max(250, managerOwnActivity.length * 44) }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={managerOwnActivity} layout="vertical" margin={{ top: 5, right: 14, left: 8, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={executiveChart.grid} />
+                  <XAxis type="number" allowDecimals={false} tick={{ fill: executiveChart.axis, fontSize: 9 }} axisLine={{ stroke: executiveChart.grid }} tickLine={false} />
+                  <YAxis type="category" dataKey="manager" width={112} tick={{ fill: executiveChart.axis, fontSize: 8 }} axisLine={false} tickLine={false} />
+                  <Tooltip contentStyle={executiveChart.tooltip} />
+                  <Legend wrapperStyle={{ color: executiveChart.muted, fontSize: 9 }} />
+                  <Bar dataKey="visits" name="Visits" fill={COLORS[0]} radius={[0, 4, 4, 0]} />
+                  <Bar dataKey="reports" name="Reports" fill={COLORS[4]} radius={[0, 4, 4, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </section>
+
+          <section className="panel fv-chart-panel">
+            <PanelTitle title="Manager team performance" icon={Gauge} />
+            <div className="fv-chart-wrap" style={{ height: Math.max(250, managerTeamActivity.length * 44) }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={managerTeamActivity} layout="vertical" margin={{ top: 5, right: 14, left: 8, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={executiveChart.grid} />
+                  <XAxis type="number" allowDecimals={false} tick={{ fill: executiveChart.axis, fontSize: 9 }} axisLine={{ stroke: executiveChart.grid }} tickLine={false} />
+                  <YAxis type="category" dataKey="manager" width={112} tick={{ fill: executiveChart.axis, fontSize: 8 }} axisLine={false} tickLine={false} />
+                  <Tooltip contentStyle={executiveChart.tooltip} />
+                  <Legend wrapperStyle={{ color: executiveChart.muted, fontSize: 9 }} />
+                  <Bar dataKey="visits" name="Team visits" fill={COLORS[1]} radius={[0, 4, 4, 0]} />
+                  <Bar dataKey="reports" name="Team reports" fill={COLORS[3]} radius={[0, 4, 4, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </section>
+        </div>
+      )}
+
       {selectedManager && (
         <section className="panel organization-performance-panel">
           <PanelTitle title="Manager performance" icon={Gauge} />
@@ -4690,6 +6104,45 @@ function ExecutiveOrganizationIntelligenceView({
             <div><strong>{reports.filter(r => selectedManager.field_reps.some(rep => String(rep.id) === String(r.created_by || ""))).length}</strong><span>Total reports</span></div>
             <div><strong>{visits.filter(v => selectedManager.field_reps.some(r => String(r.id) === String(v.user_id)) && String(v.status || "").toUpperCase() === "COMPLETED").length}</strong><span>Completed visits</span></div>
             <div><strong>{reports.filter(r => selectedManager.field_reps.some(rep => String(rep.id) === String(r.created_by || "")) && String(r.status || "").toUpperCase() === "APPROVED").length}</strong><span>Approved reports</span></div>
+          </div>
+          <div className="fv-chart-grid executive-selected-manager-chart">
+            <section className="panel fv-chart-panel">
+              <PanelTitle title="Selected manager vs team" icon={Gauge} />
+              <div className="fv-chart-wrap">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={selectedManagerComparison} margin={{ top: 5, right: 10, left: -2, bottom: 4 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={executiveChart.grid} />
+                    <XAxis dataKey="scope" tick={{ fill: executiveChart.axis, fontSize: 8 }} axisLine={{ stroke: executiveChart.grid }} tickLine={false} />
+                    <YAxis allowDecimals={false} tick={{ fill: executiveChart.axis, fontSize: 9 }} axisLine={false} tickLine={false} />
+                    <Tooltip contentStyle={executiveChart.tooltip} />
+                    <Legend wrapperStyle={{ color: executiveChart.muted, fontSize: 9 }} />
+                    <Bar dataKey="visits" name="Visits" fill={COLORS[0]} radius={[4, 4, 0, 0]} />
+                    <Bar dataKey="reports" name="Reports" fill={COLORS[4]} radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
+
+            <section className="panel fv-chart-panel">
+              <PanelTitle title="Selected team composition" icon={Users} />
+              <div className="fv-chart-wrap" style={{ height: Math.max(250, selectedManager.field_reps.length * 38) }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={selectedManager.field_reps.map(rep => ({
+                    rep: rep.full_name,
+                    visits: visits.filter(v => String(v.user_id) === String(rep.id)).length,
+                    reports: reports.filter(r => String(r.created_by || "") === String(rep.id)).length,
+                  }))} layout="vertical" margin={{ top: 5, right: 14, left: 8, bottom: 4 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={executiveChart.grid} />
+                    <XAxis type="number" allowDecimals={false} tick={{ fill: executiveChart.axis, fontSize: 9 }} axisLine={{ stroke: executiveChart.grid }} tickLine={false} />
+                    <YAxis type="category" dataKey="rep" width={102} tick={{ fill: executiveChart.axis, fontSize: 8 }} axisLine={false} tickLine={false} />
+                    <Tooltip contentStyle={executiveChart.tooltip} />
+                    <Legend wrapperStyle={{ color: executiveChart.muted, fontSize: 9 }} />
+                    <Bar dataKey="visits" name="Visits" fill={COLORS[1]} radius={[0, 4, 4, 0]} />
+                    <Bar dataKey="reports" name="Reports" fill={COLORS[3]} radius={[0, 4, 4, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
           </div>
         </section>
       )}
@@ -4774,8 +6227,9 @@ function ExecutiveOrganizationIntelligenceView({
 // ═══════════════════════════════════════════════════════════════════════════════
 // EXECUTIVE VIEWS
 // ═══════════════════════════════════════════════════════════════════════════════
-function ExecutiveViews({ view, dashboard, alerts, leads, customers, visits, reports, tasks, user, teamUsers, onGo, onUpdateTask, onOpenRepActivity, onRefresh, onNotify }: any) {
+function ExecutiveViews({ view, dashboard, alerts, leads, customers, visits, reports, tasks, user, teamUsers, onGo, onUpdateTask, onOpenRepActivity, onOpenCustomer, onStartVisit, selectedCustomerDetail, onRefresh, onNotify }: any) {
   if (view === "home") return <ExecutiveHome dashboard={dashboard} leads={leads} onGo={onGo} />;
+  if (view === "visits") return <ManagementVisitsView visits={visits} user={user} onGo={onGo} />;
   if (view === "reports") return <ReportsListView reports={reports} user={user} onRefresh={onRefresh} onNotify={onNotify} onGo={onGo} />;
   if (view === "tasks") return <TasksView tasks={tasks} onUpdateTask={onUpdateTask} />;
   if (view === "organization") return (
@@ -4793,7 +6247,9 @@ function ExecutiveViews({ view, dashboard, alerts, leads, customers, visits, rep
       onNotify={onNotify}
     />
   );
-  if (view === "insights") return <InsightsView dashboard={dashboard} alerts={alerts} />;
+  if (view === "insights") return <InsightsView dashboard={dashboard} alerts={alerts} tasks={tasks} visits={visits} reports={reports} />;
+  if (view === "customers") return <CustomersView customers={customers} onGo={onGo} onOpenCustomer={onOpenCustomer} onStartVisit={onStartVisit} user={user} teamUsers={teamUsers} onRefresh={onRefresh} onNotify={onNotify} canStartVisit={false} />;
+  if (view === "customer-detail") return <CustomerDetailView selectedCustomerDetail={selectedCustomerDetail} visits={visits} reports={reports} tasks={tasks} onGo={onGo} canStartVisit={false} />;
   if (view === "map") return <TerritoryView customers={customers} />;
   if (view === "team") return (
     <TeamView
@@ -4821,12 +6277,11 @@ function ExecutiveHome({ dashboard, leads, onGo }: { dashboard: DashboardData | 
         eyebrow="EXECUTIVE INTELLIGENCE"
         title="The field, without the reporting gap."
         sub="A consolidated view of customer signals, pipeline movement and field coverage."
+        action={<button className="button primary" onClick={() => onGo("customers")}><Plus size={14} /> New Customer</button>}
       />
       <div className="metric-grid">
         <Metric icon={MapPin} label="Field visits" value={dashboard?.overview.total_visits ?? 0} sub="Organization-wide" />
         <Metric icon={Users} label="Customers" value={dashboard?.overview.total_customers ?? 0} sub="Accounts covered" />
-        <Metric icon={Target} label="Open pipeline" value={money(dashboard?.overview.pipeline_value)} sub="Current value" tone="amber" />
-        <Metric icon={Zap} label="Won value" value={money(dashboard?.overview.won_value)} sub="Closed value" tone="green" />
       </div>
       <div className="grid-2">
         <div className="panel hero-exec">
@@ -4837,10 +6292,6 @@ function ExecutiveHome({ dashboard, leads, onGo }: { dashboard: DashboardData | 
             <div><strong>{dashboard?.overview.high_opportunities ?? 0}</strong><span>high opportunities</span></div>
             <div><strong>{dashboard?.overview.high_risks ?? 0}</strong><span>high risks</span></div>
           </div>
-        </div>
-        <div className="panel">
-          <PanelTitle title="Pipeline distribution" icon={Target} />
-          <PipelineBar pipeline={dashboard?.pipeline || []} />
         </div>
       </div>
       <div className="panel" style={{ marginTop: 8 }}>
@@ -4855,6 +6306,50 @@ function ExecutiveHome({ dashboard, leads, onGo }: { dashboard: DashboardData | 
 function TerritoryView({ customers = [] }: { customers?: ApiCustomer[] }) {
   const [pos, setPos] = useState<[number, number]>([18.5913, 73.7389]);
   const [loc, setLoc] = useState(false);
+  const [liveReps, setLiveReps] = useState<LiveRepLocation[]>([]);
+  const [mapVisits, setMapVisits] = useState<any[]>([]);
+  const [mapLeads, setMapLeads] = useState<ApiLead[]>([]);
+  const [mapLoading, setMapLoading] = useState(true);
+  const [mapError, setMapError] = useState("");
+  const [showHeat, setShowHeat] = useState(true);
+  const [showCustomers, setShowCustomers] = useState(true);
+  const [showReps, setShowReps] = useState(true);
+  const [showConflicts, setShowConflicts] = useState(true);
+  const [lastLiveUpdate, setLastLiveUpdate] = useState<Date | null>(null);
+
+  const loadTerritoryData = useCallback(async () => {
+    setMapLoading(true);
+    try {
+      const results = await Promise.allSettled([
+        apiGet<any>("/territory-live/locations"),
+        apiGet<any>("/visits/"),
+        apiGet<any>("/leads/"),
+      ]);
+
+      const [locationsResult, visitsResult, leadsResult] = results;
+      if (locationsResult.status === "fulfilled") {
+        setLiveReps(locationsResult.value?.locations || []);
+        setLastLiveUpdate(new Date());
+      }
+      if (visitsResult.status === "fulfilled") {
+        setMapVisits(visitsResult.value?.visits || []);
+      }
+      if (leadsResult.status === "fulfilled") {
+        setMapLeads(leadsResult.value?.leads || []);
+      }
+
+      if (results.every(result => result.status === "rejected")) {
+        setMapError("Territory intelligence could not be refreshed.");
+      } else {
+        setMapError("");
+      }
+    } catch (e: any) {
+      setMapError(e?.message || "Territory intelligence could not be refreshed.");
+    } finally {
+      setMapLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     navigator.geolocation?.getCurrentPosition(
       p => { setPos([p.coords.latitude, p.coords.longitude]); setLoc(true); },
@@ -4862,47 +6357,414 @@ function TerritoryView({ customers = [] }: { customers?: ApiCustomer[] }) {
     );
   }, []);
 
+  useEffect(() => {
+    void loadTerritoryData();
+    const timer = window.setInterval(() => void loadTerritoryData(), 15000);
+    return () => window.clearInterval(timer);
+  }, [loadTerritoryData]);
+
+  const mappedCustomers = useMemo(
+    () => customers.filter(c => Number.isFinite(c.latitude) && Number.isFinite(c.longitude)),
+    [customers]
+  );
+
+  const visitPoints = useMemo(
+    () => mapVisits.filter(v => Number.isFinite(Number(v.latitude)) && Number.isFinite(Number(v.longitude))),
+    [mapVisits]
+  );
+
+  const customerVisitCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const visit of mapVisits) {
+      if (!visit?.customer_id) continue;
+      counts[String(visit.customer_id)] = (counts[String(visit.customer_id)] || 0) + 1;
+    }
+    return counts;
+  }, [mapVisits]);
+
+  const heatPoints = useMemo(() => {
+    const points: Array<{ id: string; lat: number; lng: number; weight: number; label: string }> = [];
+    for (const customer of mappedCustomers) {
+      const weight = 1 + (customerVisitCounts[String(customer.id)] || 0);
+      points.push({
+        id: `customer-${customer.id}`,
+        lat: Number(customer.latitude),
+        lng: Number(customer.longitude),
+        weight,
+        label: customer.name,
+      });
+    }
+    visitPoints.forEach((visit, index) => {
+      points.push({
+        id: `visit-${visit.id || index}`,
+        lat: Number(visit.latitude),
+        lng: Number(visit.longitude),
+        weight: 1,
+        label: visit.customer_name || "Field visit",
+      });
+    });
+    return points;
+  }, [mappedCustomers, customerVisitCounts, visitPoints]);
+
+  const maxHeatWeight = Math.max(1, ...heatPoints.map(point => point.weight));
+  const heatStyle = (weight: number) => {
+    const intensity = Math.min(1, weight / Math.max(3, maxHeatWeight));
+    if (intensity >= 0.8) {
+      return { color: "#e24d73", fillColor: "#e24d73", fillOpacity: 0.18, radius: 1000 + weight * 350 };
+    }
+    if (intensity >= 0.5) {
+      return { color: "#e39a4f", fillColor: "#e39a4f", fillOpacity: 0.15, radius: 800 + weight * 300 };
+    }
+    return { color: "#6c8cff", fillColor: "#6c8cff", fillOpacity: 0.12, radius: 650 + weight * 250 };
+  };
+
+  const liveRepCount = liveReps.filter(rep => rep.status === "LIVE").length;
+  const staleRepCount = liveReps.filter(rep => rep.status === "STALE").length;
+
+  const conflictPairs = useMemo(() => {
+    const pairs: Array<{ key: string; a: LiveRepLocation; b: LiveRepLocation; distance: number; severity: "HIGH" | "MEDIUM" }> = [];
+    for (let i = 0; i < liveReps.length; i += 1) {
+      const a = liveReps[i];
+      if (!a.has_location || a.latitude == null || a.longitude == null) continue;
+      for (let j = i + 1; j < liveReps.length; j += 1) {
+        const b = liveReps[j];
+        if (!b.has_location || b.latitude == null || b.longitude == null) continue;
+        const distance = distanceMeters(Number(a.latitude), Number(a.longitude), Number(b.latitude), Number(b.longitude));
+        if (distance <= 150) {
+          pairs.push({
+            key: `${a.user_id}-${b.user_id}`,
+            a,
+            b,
+            distance,
+            severity: distance <= 50 ? "HIGH" : "MEDIUM",
+          });
+        }
+      }
+    }
+    return pairs;
+  }, [liveReps]);
+
+  const activeCustomerConflicts = useMemo(() => {
+    const byCustomer: Record<string, any[]> = {};
+    for (const visit of mapVisits) {
+      const status = String(visit?.status || "").toUpperCase();
+      if (status !== "IN_PROGRESS" || !visit?.customer_id || !visit?.user_id) continue;
+      const key = String(visit.customer_id);
+      (byCustomer[key] ||= []).push(visit);
+    }
+    return Object.entries(byCustomer)
+      .filter(([, rows]) => new Set(rows.map(row => String(row.user_id))).size > 1)
+      .map(([customerId, rows]) => ({ customerId, rows }));
+  }, [mapVisits]);
+
+  const conflictCount = conflictPairs.length + activeCustomerConflicts.length;
+
+  const visitTrend = useMemo(() => {
+    const now = new Date();
+    const rows: Array<{ day: string; visits: number }> = [];
+    for (let i = 6; i >= 0; i -= 1) {
+      const d = new Date(now);
+      d.setHours(0, 0, 0, 0);
+      d.setDate(now.getDate() - i);
+      const next = new Date(d);
+      next.setDate(d.getDate() + 1);
+      const count = mapVisits.filter(v => {
+        const vd = new Date(v.visit_date);
+        return vd >= d && vd < next;
+      }).length;
+      rows.push({ day: d.toLocaleDateString("en-IN", { weekday: "short" }), visits: count });
+    }
+    return rows;
+  }, [mapVisits]);
+
+  const customerCityData = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const customer of customers) {
+      const city = customer.city?.trim() || "Unknown";
+      counts[city] = (counts[city] || 0) + 1;
+    }
+    return Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6)
+      .map(([city, count]) => ({ city, customers: count }));
+  }, [customers]);
+
+  const pipelineValue = useMemo(
+    () => mapLeads.reduce((sum, lead) => sum + Number(lead.value || 0), 0),
+    [mapLeads]
+  );
+
+  const fieldRepMarker = (rep: LiveRepLocation) => {
+    if (!rep.has_location || rep.latitude == null || rep.longitude == null) return null;
+    return (
+      <Marker key={`rep-${rep.user_id}`} position={[Number(rep.latitude), Number(rep.longitude)]}>
+        <Popup>
+          <b>{rep.full_name}</b><br />
+          Field Rep{rep.territory_name ? ` · ${rep.territory_name}` : ""}<br />
+          {rep.status === "LIVE" ? "Live now" : rep.status === "STALE" ? "Last seen recently" : "Offline"}<br />
+          {rep.activity || "Field activity"}<br />
+          {rep.updated_at ? fmtDateTime(rep.updated_at) : "No recent timestamp"}
+        </Popup>
+      </Marker>
+    );
+  };
+
   return (
-    <>
+    <div className="territory-page">
       <SectionHeader
         eyebrow="TERRITORY INTELLIGENCE"
-        title="Field coverage map"
-        sub="Customer locations, field position and territory context."
-        action={<span className="pill"><Navigation size={13} />{loc ? "Live location" : "Demo center"}</span>}
+        title="Live territory coverage"
+        sub="See activity hotspots, customer density, Field Rep locations and collision risks in one view."
+        action={(
+          <div className="territory-header-status">
+            <span className={`territory-live-pill ${loc ? "is-live" : ""}`}>
+              <Navigation size={13} />
+              {loc ? "Device location active" : "Device location unavailable"}
+            </span>
+            <span className="territory-live-pill">
+              <Activity size={13} />
+              {lastLiveUpdate ? `Updated ${relTime(lastLiveUpdate.toISOString())}` : "Syncing…"}
+            </span>
+          </div>
+        )}
       />
-      <div className="map-layout">
-        <div className="panel map-card">
-          <MapContainer center={pos} zoom={11} scrollWheelZoom style={{ height: "560px", width: "100%" }}>
-            <TileLayer attribution='&copy; OpenStreetMap contributors' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-            <Marker position={pos}>
-              <Popup><b>Your current field position</b><br />{loc ? "Browser GPS location" : "Demo location"}</Popup>
-            </Marker>
-            <LeafletCircle center={pos} radius={5000} pathOptions={{ color: "#b83b68", fillOpacity: 0.06 }} />
-            {customers.filter(c => c.latitude && c.longitude).map(c => (
-              <Marker key={c.id} position={[c.latitude!, c.longitude!]}>
-                <Popup><b>{c.name}</b><br />{c.contact_person || ""}<br />{c.city || ""}</Popup>
-              </Marker>
-            ))}
-          </MapContainer>
-        </div>
-        <div className="panel">
-          <PanelTitle title="Coverage" icon={MapPin} />
-          <div className="map-stat"><strong>{customers.length}</strong><span>customers in organization</span></div>
-          <div className="map-stat"><strong>{customers.filter(c => c.latitude && c.longitude).length}</strong><span>mapped customers</span></div>
-          <div className="privacy-note">
-            <Navigation size={15} />
-            <span>Location is requested only by the browser and is not persisted unless a visit is recorded.</span>
-          </div>
-          <div className="map-legend">
-            <span><i className="legend-dot customer" /> Customer</span>
-            <span><i className="legend-dot rep" /> Field position</span>
-          </div>
-        </div>
+
+      <div className="territory-kpi-grid">
+        <Metric icon={Users} label="Customers" value={customers.length} sub={`${mappedCustomers.length} on map`} />
+        <Metric icon={MapPin} label="Visits" value={mapVisits.length} sub="Recorded field activity" />
+        <Metric icon={Navigation} label="Live reps" value={liveRepCount} sub={staleRepCount ? `${staleRepCount} stale` : "Current locations"} tone="green" />
+        <Metric icon={AlertTriangle} label="Conflicts" value={conflictCount} sub={conflictCount ? "Review now" : "No conflict detected"} tone={conflictCount ? "red" : undefined} />
       </div>
-    </>
+
+      <section className="territory-main-grid">
+        <div className="panel territory-map-panel">
+          <div className="territory-card-head">
+            <div>
+              <span className="territory-kicker">LIVE MAP</span>
+              <h2>Field activity by location</h2>
+              <p>Hotter zones indicate denser customer activity and repeat visits.</p>
+            </div>
+            <div className="territory-map-head-right">
+              <span className="territory-map-count"><strong>{heatPoints.length}</strong> points</span>
+              <button className="icon-btn" type="button" onClick={() => void loadTerritoryData()} aria-label="Refresh territory map" title="Refresh territory map">
+                <RefreshCw size={15} className={mapLoading ? "spin" : ""} />
+              </button>
+            </div>
+          </div>
+
+          <div className="territory-map-controls" aria-label="Map layers">
+            <button type="button" className={`territory-toggle ${showHeat ? "active heat" : ""}`} onClick={() => setShowHeat(v => !v)}>
+              <i className="territory-dot hot" /> Heatmap {showHeat ? "On" : "Off"}
+            </button>
+            <button type="button" className={`territory-toggle ${showCustomers ? "active" : ""}`} onClick={() => setShowCustomers(v => !v)}>
+              <i className="territory-dot customer" /> Customers {showCustomers ? "On" : "Off"}
+            </button>
+            <button type="button" className={`territory-toggle ${showReps ? "active rep" : ""}`} onClick={() => setShowReps(v => !v)}>
+              <i className="territory-dot rep" /> Live reps {showReps ? "On" : "Off"}
+            </button>
+            <button type="button" className={`territory-toggle ${showConflicts ? "active conflict" : ""}`} onClick={() => setShowConflicts(v => !v)}>
+              <i className="territory-dot conflict" /> Conflict zones {showConflicts ? "On" : "Off"}
+            </button>
+          </div>
+
+          <div className="territory-map-frame">
+            <MapContainer center={pos} zoom={11} scrollWheelZoom className="territory-leaflet-map">
+              <TileLayer attribution='&copy; OpenStreetMap contributors' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+
+              <Marker position={pos}>
+                <Popup><b>Your current field position</b><br />{loc ? "Browser GPS location" : "Demo location"}</Popup>
+              </Marker>
+
+              {showHeat && heatPoints.map(point => {
+                const style = heatStyle(point.weight);
+                return (
+                  <LeafletCircle
+                    key={`heat-${point.id}`}
+                    center={[point.lat, point.lng]}
+                    radius={style.radius}
+                    pathOptions={{ color: style.color, fillColor: style.fillColor, fillOpacity: style.fillOpacity, weight: 1 }}
+                  />
+                );
+              })}
+
+              {showCustomers && mappedCustomers.map(c => (
+                <Marker key={c.id} position={[Number(c.latitude), Number(c.longitude)]}>
+                  <Popup>
+                    <b>{c.name}</b><br />
+                    {c.contact_person || ""}<br />
+                    {c.city || ""}<br />
+                    Visits: {customerVisitCounts[String(c.id)] || 0}
+                  </Popup>
+                </Marker>
+              ))}
+
+              {showReps && liveReps.map(fieldRepMarker)}
+
+              {showConflicts && conflictPairs.map(pair => (
+                <LeafletCircle
+                  key={`conflict-${pair.key}`}
+                  center={[
+                    (Number(pair.a.latitude) + Number(pair.b.latitude)) / 2,
+                    (Number(pair.a.longitude) + Number(pair.b.longitude)) / 2,
+                  ]}
+                  radius={Math.max(40, pair.distance / 1.7)}
+                  pathOptions={{ color: pair.severity === "HIGH" ? "#e05a7a" : "#f5b84b", fillOpacity: 0.08, weight: 2, dashArray: "5 5" }}
+                />
+              ))}
+
+              <LeafletCircle center={pos} radius={5000} pathOptions={{ color: "#b83b68", fillOpacity: 0.025 }} />
+            </MapContainer>
+
+            <div className="territory-map-legend">
+              <span><i className="territory-dot hot" /> High activity</span>
+              <span><i className="territory-dot customer" /> Customer</span>
+              <span><i className="territory-dot rep" /> Field Rep</span>
+              <span><i className="territory-dot conflict" /> Conflict</span>
+            </div>
+          </div>
+        </div>
+
+        <aside className="territory-side-rail">
+          <div className="panel territory-side-card">
+            <div className="territory-section-title">
+              <div><span className="territory-kicker">FIELD FORCE</span><h3>Live Field Reps</h3></div>
+              <span className="territory-mini-count">{liveRepCount} live</span>
+            </div>
+            {liveReps.length === 0 ? (
+              <div className="territory-empty">
+                <Navigation size={18} />
+                <strong>{mapLoading ? "Loading locations…" : "No live location yet"}</strong>
+                <span>Rep location appears here when the Field Rep workspace is open and location sharing is enabled.</span>
+              </div>
+            ) : (
+              <div className="territory-rep-list">
+                {liveReps.map(rep => (
+                  <div className="territory-rep-row" key={rep.user_id}>
+                    <div className="territory-rep-main">
+                      <div className="avatar">{initials(rep.full_name)}</div>
+                      <div className="territory-rep-copy">
+                        <strong>{rep.full_name}</strong>
+                        <span>{rep.territory_name || "Assigned territory"}</span>
+                      </div>
+                    </div>
+                    <div className="territory-rep-state">
+                      <span className={`territory-state ${rep.status.toLowerCase()}`}><i />{rep.status === "LIVE" ? "Live" : rep.status === "STALE" ? "Stale" : "Offline"}</span>
+                      <small>{rep.updated_at ? relTime(rep.updated_at) : "—"}</small>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className={`panel territory-side-card ${conflictCount ? "has-conflicts" : ""}`}>
+            <div className="territory-section-title">
+              <div><span className="territory-kicker">COLLISION CONTROL</span><h3>Conflict monitor</h3></div>
+              <span className={`territory-mini-count ${conflictCount ? "danger" : "good"}`}>{conflictCount}</span>
+            </div>
+            {conflictCount === 0 ? (
+              <div className="territory-safe-state">
+                <div className="territory-safe-icon"><CheckCircle2 size={16} /></div>
+                <div><strong>No active conflicts</strong><span>Rep proximity and duplicate active visits are clear.</span></div>
+              </div>
+            ) : (
+              <div className="territory-conflict-list">
+                {activeCustomerConflicts.map(conflict => (
+                  <div key={`customer-${conflict.customerId}`} className="territory-conflict-item high">
+                    <span className="territory-conflict-tag">CUSTOMER</span>
+                    <div>
+                      <strong>Duplicate active visit</strong>
+                      <span>{conflict.rows.map((row: any) => row.user_name || row.user_id).join(" + ")}</span>
+                    </div>
+                  </div>
+                ))}
+                {conflictPairs.slice(0, 6).map(pair => (
+                  <div key={pair.key} className={`territory-conflict-item ${pair.severity === "HIGH" ? "high" : "medium"}`}>
+                    <span className="territory-conflict-tag">PROXIMITY</span>
+                    <div>
+                      <strong>{Math.round(pair.distance)}m apart</strong>
+                      <span>{pair.a.full_name} + {pair.b.full_name}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </aside>
+      </section>
+
+      <section className="territory-analytics-grid">
+        <div className="panel territory-chart-card">
+          <div className="territory-section-title">
+            <div><span className="territory-kicker">7-DAY ACTIVITY</span><h3>Visit trend</h3></div>
+            <span className="territory-chart-note">Field visits</span>
+          </div>
+          <div className="territory-chart"><ResponsiveContainer width="100%" height="100%">
+            <BarChart data={visitTrend} margin={{ left: -14, right: 4, top: 6, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" opacity={0.14} />
+              <XAxis dataKey="day" tick={{ fontSize: 9 }} axisLine={false} tickLine={false} />
+              <YAxis allowDecimals={false} tick={{ fontSize: 9 }} axisLine={false} tickLine={false} width={24} />
+              <Tooltip />
+              <Bar dataKey="visits" name="Visits" fill="#b83b68" radius={[6, 6, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer></div>
+        </div>
+
+        <div className="panel territory-chart-card">
+          <div className="territory-section-title">
+            <div><span className="territory-kicker">CUSTOMER MIX</span><h3>Density by city</h3></div>
+            <span className="territory-chart-note">Top 6</span>
+          </div>
+          {customerCityData.length === 0 ? <div className="territory-empty compact"><Users size={17} /><span>No customer city data.</span></div> : (
+            <div className="territory-chart"><ResponsiveContainer width="100%" height="100%">
+              <BarChart data={customerCityData} layout="vertical" margin={{ left: 8, right: 10, top: 2, bottom: 2 }}>
+                <CartesianGrid strokeDasharray="3 3" opacity={0.12} />
+                <XAxis type="number" allowDecimals={false} tick={{ fontSize: 8 }} axisLine={false} tickLine={false} />
+                <YAxis type="category" dataKey="city" width={62} tick={{ fontSize: 8 }} axisLine={false} tickLine={false} />
+                <Tooltip />
+                <Bar dataKey="customers" name="Customers" fill="#6c8cff" radius={[0, 5, 5, 0]} />
+              </BarChart>
+            </ResponsiveContainer></div>
+          )}
+        </div>
+
+        <div className="panel territory-signal-card">
+          <div className="territory-section-title">
+            <div><span className="territory-kicker">COMMERCIAL SIGNAL</span><h3>Opportunity snapshot</h3></div>
+            <Target size={16} />
+          </div>
+          <div className="territory-signal-hero">
+            <span>Aggregate lead value in your visible scope</span>
+            <strong>{money(pipelineValue)}</strong>
+          </div>
+          <div className="territory-signal-grid">
+            <div><span>Mapped customers</span><strong>{mappedCustomers.length}</strong></div>
+            <div><span>Heat points</span><strong>{heatPoints.length}</strong></div>
+            <div><span>Live reps</span><strong>{liveRepCount}</strong></div>
+            <div><span>Open conflicts</span><strong className={conflictCount ? "danger" : "good"}>{conflictCount}</strong></div>
+          </div>
+        </div>
+      </section>
+
+      <section className="panel territory-explainer">
+        <div className="territory-section-title">
+          <div><span className="territory-kicker">HOW TO READ IT</span><h3>Heatmap & operating rule</h3></div>
+          <Info size={16} />
+        </div>
+        <div className="territory-rule-grid">
+          <div><i className="territory-dot hot" /><span><strong>Hot</strong> — concentrated customers and repeated visits.</span></div>
+          <div><i className="territory-dot medium" /><span><strong>Medium</strong> — moderate field activity.</span></div>
+          <div><i className="territory-dot low" /><span><strong>Low</strong> — sparse customer / visit activity.</span></div>
+        </div>
+        <div className="territory-note">
+          <AlertTriangle size={14} />
+          <span>Conflict zones are advisory. A rep pair within 150m is flagged; multiple reps with simultaneous <strong>IN_PROGRESS</strong> visits to the same customer are treated as a stronger conflict.</span>
+        </div>
+        {mapError && <div className="error-box territory-error"><AlertTriangle size={14} />{mapError}</div>}
+      </section>
+    </div>
   );
 }
-
 // ─── TEAM VIEW ────────────────────────────────────────────────────────────────
 function TeamView({
   executive = false,
@@ -4931,6 +6793,19 @@ function TeamView({
   const [activityError, setActivityError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [assigningId, setAssigningId] = useState<string | null>(null);
+  const [hireRepOpen, setHireRepOpen] = useState(false);
+  const [hireRepBusy, setHireRepBusy] = useState(false);
+  const [hireRepRegions, setHireRepRegions] = useState<Array<{ id: string; name: string; city?: string | null }>>([]);
+  const [hireRepForm, setHireRepForm] = useState({
+    full_name: "",
+    email: "",
+    phone: "",
+    password: "Temp@1234",
+    territory_id: "",
+  });
+  const [teamRegionFilter, setTeamRegionFilter] = useState("ALL");
+  const [teamSearch, setTeamSearch] = useState("");
+  const [teamStatusFilter, setTeamStatusFilter] = useState("ALL");
 
   const normalizedUsers = users
     .filter((u: ApiTeamUser) => u?.id)
@@ -4949,7 +6824,22 @@ function TeamView({
         return false;
       });
 
-  const visibleTeam = executive ? fieldReps : directTeam;
+  const visibleTeam = (executive ? fieldReps : directTeam)
+    .filter(member => teamRegionFilter === "ALL" || String(member.territory_id || "") === teamRegionFilter)
+    .filter(member => teamStatusFilter === "ALL" || (teamStatusFilter === "ACTIVE" ? member.is_active !== false : member.is_active === false))
+    .filter(member => {
+      const q = teamSearch.trim().toLowerCase();
+      return !q || member.full_name.toLowerCase().includes(q) || member.email.toLowerCase().includes(q);
+    });
+
+  const teamRegions = Array.from(
+    new Map(
+      (executive ? fieldReps : directTeam)
+        .filter(u => u.territory_id && u.territory_name)
+        .map(u => [String(u.territory_id), String(u.territory_name)])
+    ),
+    ([id, name]) => ({ id, name })
+  ).sort((a, b) => a.name.localeCompare(b.name));
 
   const countVisits = (memberId: string) =>
     visits.filter((v: ApiVisit) => String(v.user_id) === String(memberId)).length;
@@ -5046,6 +6936,73 @@ function TeamView({
     }
   }
 
+  async function openHireRepModal() {
+    if (executive || hireRepBusy) return;
+
+    setHireRepOpen(true);
+    try {
+      const response = await apiGet<{ regions?: Array<{ id: string; name: string; city?: string | null; is_active?: boolean }> }>(
+        "/org-management/regions"
+      );
+      const regionsForManager = (response?.regions || [])
+        .filter(region => region?.id && region.is_active !== false)
+        .map(region => ({ id: String(region.id), name: region.name, city: region.city }));
+
+      setHireRepRegions(regionsForManager);
+      setHireRepForm(current => ({
+        ...current,
+        territory_id: current.territory_id && regionsForManager.some(r => r.id === current.territory_id)
+          ? current.territory_id
+          : regionsForManager[0]?.id || "",
+      }));
+    } catch (e: any) {
+      setHireRepRegions([]);
+      onNotify?.(e?.message || "Could not load your managed regions.");
+    }
+  }
+
+  function closeHireRepModal() {
+    if (hireRepBusy) return;
+    setHireRepOpen(false);
+  }
+
+  async function hireFieldRep() {
+    if (hireRepBusy) return;
+
+    if (!hireRepForm.full_name.trim() || !hireRepForm.email.trim() || !hireRepForm.password.trim()) {
+      onNotify?.("Name, email and password are required.");
+      return;
+    }
+
+    if (!hireRepForm.territory_id) {
+      onNotify?.("Select a region for the new Field Rep.");
+      return;
+    }
+
+    setHireRepBusy(true);
+    try {
+      await apiPost("/org-management/employees", {
+        full_name: hireRepForm.full_name.trim(),
+        email: hireRepForm.email.trim(),
+        password: hireRepForm.password,
+        role: "FIELD_REP",
+        phone: hireRepForm.phone.trim() || null,
+        manager_id: user?.id ? String(user.id) : null,
+        territory_id: hireRepForm.territory_id,
+        region_ids: [hireRepForm.territory_id],
+      });
+
+      onNotify?.("Field Rep account created and assigned to your team.");
+      setHireRepOpen(false);
+      setHireRepForm({ full_name: "", email: "", phone: "", password: "Temp@1234", territory_id: "" });
+      await onRefresh?.();
+    } catch (e: any) {
+      onNotify?.(e?.message || "Could not create the Field Rep account.");
+    } finally {
+      setHireRepBusy(false);
+    }
+  }
+
   const statusLabel = (active?: boolean) => active === false ? "Inactive" : "Active";
 
   const activityStatusBadge = (status: string) => {
@@ -5105,6 +7062,7 @@ function TeamView({
             >
               <span>{member.email}</span>
               {member.phone && <span>· {member.phone}</span>}
+              {member.territory_name && <span>· Region: {member.territory_name}</span>}
               {member.manager_name && <span>· Manager: {member.manager_name}</span>}
             </div>
           </div>
@@ -5384,16 +7342,29 @@ function TeamView({
             : "Your assigned Field Reps, their recent field activity, and report progress."
         }
         action={
-          <button
-            type="button"
-            className="button ghost"
-            onClick={() => { void refreshTeam(); }}
-            disabled={!onRefresh || refreshing}
-            style={{ minWidth: 90 }}
-          >
-            {refreshing ? <Spinner size={12} /> : <RefreshCw size={12} />}
-            {refreshing ? "Refreshing…" : "Refresh"}
-          </button>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
+            <button
+              type="button"
+              className="button ghost"
+              onClick={() => { void refreshTeam(); }}
+              disabled={!onRefresh || refreshing}
+              style={{ minWidth: 90 }}
+            >
+              {refreshing ? <Spinner size={12} /> : <RefreshCw size={12} />}
+              {refreshing ? "Refreshing…" : "Refresh"}
+            </button>
+            {!executive && (
+              <button
+                type="button"
+                className="button primary"
+                onClick={() => { void openHireRepModal(); }}
+                disabled={hireRepBusy}
+              >
+                {hireRepBusy ? <Spinner size={12} /> : <Plus size={13} />}
+                Hire Field Rep
+              </button>
+            )}
+          </div>
         }
       />
 
@@ -5403,6 +7374,48 @@ function TeamView({
           <span>{activityError}</span>
         </div>
       )}
+
+      <div className="team-directory-filter-panel panel">
+        <div className="team-directory-filter-head">
+          <div>
+            <strong>Field Rep directory</strong>
+            <span>{executive ? "Organization-wide Field Rep visibility." : "Your assigned Field Reps, organized by region."}</span>
+          </div>
+          <button type="button" className="button ghost" onClick={() => {
+            setTeamRegionFilter("ALL"); setTeamStatusFilter("ALL"); setTeamSearch("");
+          }}>
+            Clear filters
+          </button>
+        </div>
+        <div className="team-directory-filters">
+          <label>
+            <span>Region</span>
+            <select value={teamRegionFilter} onChange={e => setTeamRegionFilter(e.target.value)}>
+              <option value="ALL">Overall — all regions</option>
+              {teamRegions.map(region => <option key={region.id} value={region.id}>{region.name}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>Status</span>
+            <select value={teamStatusFilter} onChange={e => setTeamStatusFilter(e.target.value)}>
+              <option value="ALL">All status</option>
+              <option value="ACTIVE">Active only</option>
+              <option value="INACTIVE">Inactive only</option>
+            </select>
+          </label>
+          <label className="team-directory-search">
+            <span>Search Field Rep</span>
+            <div className="search-box">
+              <Search size={13} />
+              <input value={teamSearch} onChange={e => setTeamSearch(e.target.value)} placeholder="Name or email…" />
+            </div>
+          </label>
+        </div>
+        <div className="team-directory-summary">
+          <strong>{visibleTeam.length}</strong>
+          <span>Field Rep{visibleTeam.length === 1 ? "" : "s"} shown</span>
+        </div>
+      </div>
 
       <div className="metric-grid">
         <Metric
@@ -5542,6 +7555,93 @@ function TeamView({
         </div>
       )}
 
+      {hireRepOpen && !executive && (
+        <div className="modal-backdrop" onClick={e => { if (e.target === e.currentTarget) closeHireRepModal(); }}>
+          <div className="organization-employee-modal">
+            <div className="organization-modal-head">
+              <div>
+                <span className="eyebrow">TEAM RECRUITMENT</span>
+                <h2>Hire Field Rep</h2>
+                <p>Create a Field Rep account and assign them directly to your team.</p>
+              </div>
+              <button type="button" className="icon-btn" onClick={closeHireRepModal} disabled={hireRepBusy}>
+                <X size={15} />
+              </button>
+            </div>
+
+            <div className="organization-form-grid">
+              <label>
+                <span>Full name</span>
+                <input
+                  value={hireRepForm.full_name}
+                  onChange={e => setHireRepForm(f => ({ ...f, full_name: e.target.value }))}
+                  placeholder="Field Rep name"
+                />
+              </label>
+              <label>
+                <span>Email</span>
+                <input
+                  type="email"
+                  value={hireRepForm.email}
+                  onChange={e => setHireRepForm(f => ({ ...f, email: e.target.value }))}
+                  placeholder="rep@company.com"
+                />
+              </label>
+              <label>
+                <span>Phone</span>
+                <input
+                  value={hireRepForm.phone}
+                  onChange={e => setHireRepForm(f => ({ ...f, phone: e.target.value }))}
+                  placeholder="Optional"
+                />
+              </label>
+              <label>
+                <span>Temporary password</span>
+                <input
+                  value={hireRepForm.password}
+                  onChange={e => setHireRepForm(f => ({ ...f, password: e.target.value }))}
+                />
+              </label>
+              <label>
+                <span>Region</span>
+                <select
+                  value={hireRepForm.territory_id}
+                  onChange={e => setHireRepForm(f => ({ ...f, territory_id: e.target.value }))}
+                  disabled={!hireRepRegions.length || hireRepBusy}
+                >
+                  <option value="">Select Region</option>
+                  {hireRepRegions.map(region => (
+                    <option key={region.id} value={region.id}>
+                      {region.name}{region.city ? ` · ${region.city}` : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <div style={{ marginTop: 12, padding: 10, border: "1px solid rgba(184,59,104,.18)", borderRadius: 9, background: "rgba(184,59,104,.04)", fontSize: 9, color: "#8d808a", lineHeight: 1.5 }}>
+              <strong style={{ color: "#c86589", display: "block", marginBottom: 3 }}>Manager assignment</strong>
+              This Field Rep will automatically report to <strong>{user?.full_name || "you"}</strong>. The backend restricts the region selection to regions you manage.
+            </div>
+
+            {!hireRepRegions.length && (
+              <div className="auth-error" style={{ marginTop: 10 }}>
+                <AlertTriangle size={14} />
+                <span>No managed regions were returned. Assign a region to this Manager before hiring a Field Rep.</span>
+              </div>
+            )}
+
+            <div className="organization-modal-actions">
+              <button type="button" className="button ghost" onClick={closeHireRepModal} disabled={hireRepBusy}>Cancel</button>
+              <button type="button" className="button primary" onClick={() => void hireFieldRep()} disabled={hireRepBusy || !hireRepRegions.length}>
+                {hireRepBusy ? <Spinner size={12} /> : <Plus size={13} />}
+                {hireRepBusy ? "Creating…" : "Create Field Rep"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="panel" style={{ marginTop: 14 }}>
         <PanelTitle title={executive ? "Access scope" : "Team data scope"} icon={ShieldCheck} />
         <p style={{ fontSize: 9, color: "#8d808a", margin: "8px 0 10px", lineHeight: 1.5 }}>
@@ -5586,12 +7686,22 @@ function RepActivityView({
   loading,
   onBack,
   onRefresh,
+  visits = [],
+  reports = [],
+  teamUsers = [],
+  currentUser,
+  onNotify,
 }: {
   rep: ApiTeamUser;
   activity: ApiRepActivity | null;
   loading: boolean;
   onBack: () => void;
   onRefresh: () => Promise<void> | void;
+  visits?: ApiVisit[];
+  reports?: ApiReport[];
+  teamUsers?: ApiTeamUser[];
+  currentUser?: AuthUser | null;
+  onNotify?: (message: string) => void;
 }) {
   const signalType = (value?: string | null) => {
     const v = String(value || "").toUpperCase();
@@ -5606,6 +7716,58 @@ function RepActivityView({
     if (v === "CANCELLED" || v === "REJECTED") return "error";
     return "pending";
   };
+
+  const isManager = String(currentUser?.role || "").toUpperCase() === "MANAGER";
+  const handoverTargets = (teamUsers || [])
+    .filter(u => ["FIELD_REP", "SALESPERSON"].includes(String(u.role || "").toUpperCase()))
+    .filter(u => u.is_active !== false && String(u.id) !== String(rep.id))
+    .filter(u => !rep.territory_id || !u.territory_id || String(u.territory_id) === String(rep.territory_id));
+
+  const [ownedCustomers, setOwnedCustomers] = useState<ApiCustomer[]>([]);
+  const [handoverTarget, setHandoverTarget] = useState("");
+  const [selectedCustomerIds, setSelectedCustomerIds] = useState<string[]>([]);
+  const [handoverLoading, setHandoverLoading] = useState(false);
+  const [handoverSaving, setHandoverSaving] = useState(false);
+
+  async function loadOwnedCustomers() {
+    if (!isManager) return;
+    setHandoverLoading(true);
+    try {
+      const response = await apiGet<{ customers?: ApiCustomer[] }>(
+        `/org-management/field-reps/${encodeURIComponent(rep.id)}/customers`
+      );
+      setOwnedCustomers(response?.customers || []);
+      setSelectedCustomerIds([]);
+    } catch (e: any) {
+      onNotify?.(e?.message || "Could not load customers owned by this Field Rep.");
+    } finally {
+      setHandoverLoading(false);
+    }
+  }
+
+  async function handoverCustomers() {
+    if (!handoverTarget || selectedCustomerIds.length === 0 || handoverSaving) return;
+    setHandoverSaving(true);
+    try {
+      const response = await apiPost<any>(
+        `/org-management/field-reps/${encodeURIComponent(rep.id)}/customer-handover`,
+        { target_rep_id: handoverTarget, customer_ids: selectedCustomerIds }
+      );
+      onNotify?.(response?.message || "Customers handed over successfully.");
+      setOwnedCustomers(current => current.filter(c => !selectedCustomerIds.includes(String(c.id))));
+      setSelectedCustomerIds([]);
+      await onRefresh();
+    } catch (e: any) {
+      onNotify?.(e?.message || "Customer handover failed.");
+      await loadOwnedCustomers();
+    } finally {
+      setHandoverSaving(false);
+    }
+  }
+
+  useEffect(() => {
+    if (isManager && activity) void loadOwnedCustomers();
+  }, [isManager, activity?.user?.id]);
 
   const events = activity ? [
     ...activity.recent_visits.map(v => ({
@@ -5645,6 +7807,29 @@ function RepActivityView({
     .sort((a, b) => new Date(String(b.date)).getTime() - new Date(String(a.date)).getTime())
     .slice(0, 12)
     : [];
+
+  const repVisits = useMemo(
+    () => (visits || []).filter((visit: ApiVisit) => String(visit.user_id) === String(rep.id)),
+    [visits, rep.id]
+  );
+  const repReports = useMemo(
+    () => (reports || []).filter((item: ApiReport) => String(item.created_by || "") === String(rep.id)),
+    [reports, rep.id]
+  );
+  const repTrend = useMemo(() => buildSevenDayActivity(repVisits, repReports), [repVisits, repReports]);
+  const performanceBars = [
+    { metric: "Visits", value: Number(activity?.metrics?.visits || 0) },
+    { metric: "Reports", value: Number(activity?.metrics?.reports || 0) },
+    { metric: "Submitted", value: Number(activity?.metrics?.submitted_reports || 0) },
+    { metric: "Pending tasks", value: Number(activity?.metrics?.pending_action_items || 0) },
+  ];
+  const signalBars = [
+    { metric: "High opportunity", value: Number(activity?.metrics?.high_opportunities || 0) },
+    { metric: "High risk", value: Number(activity?.metrics?.high_risks || 0) },
+    { metric: "Open alerts", value: Number(activity?.metrics?.open_alerts || 0) },
+  ];
+  const repChart = getChartTheme();
+  const repHasTrend = repTrend.some(row => row.visits > 0 || row.reports > 0);
 
   return (
     <>
@@ -5703,6 +7888,57 @@ function RepActivityView({
             <Metric icon={AlertTriangle} label="High risks" value={activity.metrics.high_risks} sub="AI signal" tone="red" />
           </div>
 
+          <div className="fv-chart-grid rep-performance-charts">
+            <section className="panel fv-chart-panel">
+              <PanelTitle title="Performance snapshot" icon={BarChart3} />
+              <div className="fv-chart-wrap">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={performanceBars} layout="vertical" margin={{ top: 5, right: 16, left: 4, bottom: 4 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={repChart.grid} />
+                    <XAxis type="number" allowDecimals={false} tick={{ fill: repChart.axis, fontSize: 9 }} axisLine={{ stroke: repChart.grid }} tickLine={false} />
+                    <YAxis type="category" dataKey="metric" width={82} tick={{ fill: repChart.axis, fontSize: 8 }} axisLine={false} tickLine={false} />
+                    <Tooltip contentStyle={repChart.tooltip} />
+                    <Bar dataKey="value" name="Count" fill={COLORS[0]} radius={[0, 4, 4, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
+
+            <section className="panel fv-chart-panel">
+              <PanelTitle title="AI & attention signals" icon={Sparkles} />
+              <div className="fv-chart-wrap">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={signalBars} layout="vertical" margin={{ top: 5, right: 16, left: 4, bottom: 4 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={repChart.grid} />
+                    <XAxis type="number" allowDecimals={false} tick={{ fill: repChart.axis, fontSize: 9 }} axisLine={{ stroke: repChart.grid }} tickLine={false} />
+                    <YAxis type="category" dataKey="metric" width={100} tick={{ fill: repChart.axis, fontSize: 8 }} axisLine={false} tickLine={false} />
+                    <Tooltip contentStyle={repChart.tooltip} />
+                    <Bar dataKey="value" name="Count" fill={COLORS[3]} radius={[0, 4, 4, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
+
+            <section className="panel fv-chart-panel fv-chart-wide">
+              <PanelTitle title="7-day activity trend" icon={TrendingUp} />
+              {!repHasTrend ? <Empty text="No visit or report trend data yet." icon={TrendingUp} /> : (
+                <div className="fv-chart-wrap">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={repTrend} margin={{ top: 5, right: 8, left: -8, bottom: 4 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={repChart.grid} />
+                      <XAxis dataKey="day" tick={{ fill: repChart.axis, fontSize: 9 }} axisLine={{ stroke: repChart.grid }} tickLine={false} />
+                      <YAxis allowDecimals={false} tick={{ fill: repChart.axis, fontSize: 9 }} axisLine={false} tickLine={false} />
+                      <Tooltip contentStyle={repChart.tooltip} />
+                      <Legend wrapperStyle={{ color: repChart.muted, fontSize: 9 }} />
+                      <Line type="monotone" dataKey="visits" name="Visits" stroke={COLORS[0]} strokeWidth={2} dot={{ r: 3 }} />
+                      <Line type="monotone" dataKey="reports" name="Reports" stroke={COLORS[4]} strokeWidth={2} dot={{ r: 3 }} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+            </section>
+          </div>
+
           {activity.latest_insight && (
             <div className="panel rep-ai-panel">
               <div className="panel-title">
@@ -5715,6 +7951,57 @@ function RepActivityView({
               </div>
               <p>{activity.latest_insight.summary || "No AI summary available."}</p>
               {activity.latest_insight.created_at && <span>Updated {fmtDateTime(activity.latest_insight.created_at)}</span>}
+            </div>
+          )}
+
+          {isManager && (
+            <div className="panel rep-handover-panel">
+              <div className="panel-title">
+                <div><Users size={15} /><h3>Customer ownership & handover</h3></div>
+                <button type="button" className="button ghost" onClick={() => void loadOwnedCustomers()} disabled={handoverLoading || handoverSaving}>
+                  {handoverLoading ? <Spinner size={12} /> : <RefreshCw size={12} />} {handoverLoading ? "Loading…" : "Load customers"}
+                </button>
+              </div>
+              <div className="rep-handover-description">
+                <span>Move customers currently owned by <strong>{rep.full_name}</strong> to another active Field Rep on your team.</span>
+                <small>Handover stays within the same region and is checked again by the backend before saving.</small>
+              </div>
+              {ownedCustomers.length > 0 && (
+                <div className="rep-handover-toolbar">
+                  <label>
+                    <span>Handover to</span>
+                    <select value={handoverTarget} onChange={e => setHandoverTarget(e.target.value)} disabled={handoverSaving}>
+                      <option value="">Select Field Rep</option>
+                      {handoverTargets.map(target => <option key={target.id} value={target.id}>{target.full_name}{target.territory_name ? ` · ${target.territory_name}` : ""}</option>)}
+                    </select>
+                  </label>
+                  <div className="rep-handover-count"><strong>{selectedCustomerIds.length}</strong><span>selected</span></div>
+                  <button type="button" className="button primary" disabled={!handoverTarget || selectedCustomerIds.length === 0 || handoverSaving} onClick={() => void handoverCustomers()}>
+                    {handoverSaving ? <Spinner size={12} /> : <Send size={12} />} {handoverSaving ? "Handing over…" : "Handover selected"}
+                  </button>
+                </div>
+              )}
+              {handoverLoading ? (
+                <div className="rep-handover-empty"><Spinner size={18} /><span>Loading customer ownership…</span></div>
+              ) : ownedCustomers.length === 0 ? (
+                <div className="rep-handover-empty"><Users size={18} /><span>No customers are currently assigned to this Field Rep.</span></div>
+              ) : (
+                <div className="rep-customer-selection">
+                  {ownedCustomers.map(customer => {
+                    const checked = selectedCustomerIds.includes(String(customer.id));
+                    return (
+                      <label className={`rep-customer-option ${checked ? "selected" : ""}`} key={customer.id}>
+                        <input type="checkbox" checked={checked} onChange={() => setSelectedCustomerIds(current => checked ? current.filter(id => id !== String(customer.id)) : [...current, String(customer.id)])} />
+                        <span className="rep-customer-option-main">
+                          <strong>{customer.name}</strong>
+                          <small>{[customer.city, customer.industry].filter(Boolean).join(" · ") || "Customer account"}</small>
+                        </span>
+                        <span className="rep-customer-region">{customer.territory_name || rep.territory_name || "Region"}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 

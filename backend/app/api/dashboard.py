@@ -118,31 +118,6 @@ def get_dashboard_overview(
         params,
     ).scalar()
 
-    # -----------------------------------------
-    # PIPELINE VALUE
-    # -----------------------------------------
-
-    pipeline_value = db.execute(
-        text(f"""
-            SELECT COALESCE(SUM(l.value), 0)
-            FROM leads l
-            WHERE l.organization_id = :organization_id
-              AND l.stage NOT IN ('WON', 'LOST')
-              {user_filter_leads}
-        """),
-        params,
-    ).scalar()
-
-    won_value = db.execute(
-        text(f"""
-            SELECT COALESCE(SUM(l.value), 0)
-            FROM leads l
-            WHERE l.organization_id = :organization_id
-              AND l.stage = 'WON'
-              {user_filter_leads}
-        """),
-        params,
-    ).scalar()
 
     # -----------------------------------------
     # AI OPPORTUNITIES
@@ -202,42 +177,6 @@ def get_dashboard_overview(
         for row in sentiment_result.mappings().all()
     ]
 
-    # -----------------------------------------
-    # LEAD PIPELINE DISTRIBUTION
-    # -----------------------------------------
-
-    pipeline_result = db.execute(
-        text(f"""
-            SELECT
-                l.stage,
-                COUNT(*) AS count,
-                COALESCE(SUM(l.value), 0) AS value
-            FROM leads l
-            WHERE l.organization_id = :organization_id
-              {user_filter_leads}
-            GROUP BY l.stage
-            ORDER BY
-                CASE l.stage
-                    WHEN 'NEW' THEN 1
-                    WHEN 'QUALIFIED' THEN 2
-                    WHEN 'PROPOSAL' THEN 3
-                    WHEN 'NEGOTIATION' THEN 4
-                    WHEN 'WON' THEN 5
-                    WHEN 'LOST' THEN 6
-                    ELSE 7
-                END
-        """),
-        params,
-    )
-
-    pipeline = [
-        {
-            "stage": row["stage"],
-            "count": row["count"],
-            "value": float(row["value"] or 0),
-        }
-        for row in pipeline_result.mappings().all()
-    ]
 
     # -----------------------------------------
     # RECENT VISITS
@@ -297,12 +236,9 @@ def get_dashboard_overview(
             "pending_action_items": action_count,
             "open_alerts": open_alert_count,
             "total_leads": lead_count,
-            "pipeline_value": float(pipeline_value or 0),
-            "won_value": float(won_value or 0),
             "high_opportunities": high_opportunity_count,
             "high_risks": high_risk_count,
         },
         "sentiment": sentiment,
-        "pipeline": pipeline,
         "recent_visits": recent_visits,
     }
