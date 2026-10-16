@@ -5,10 +5,6 @@
     "version": "0.1.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
-    "splash": {
-      "resizeMode": "contain",
-      "backgroundColor": "#0b0609"
-    },
     "android": {
       "package": "com.fieldvoice.ai"
     },
@@ -16,7 +12,8 @@
       "bundleIdentifier": "com.fieldvoice.ai"
     },
     "plugins": [
-      "expo-asset"
+      "expo-asset",
+      "expo-font"
     ]
   }
 }

@@ -83,6 +83,12 @@ def get_region(db: Session, territory_id: str, organization_id: str):
 
 
 def manager_manages_region(db: Session, manager_id: str, territory_id: str, organization_id: str) -> bool:
+    """Check active assignments, with a safe legacy fallback for manager.territory_id.
+
+    Older Manager accounts may have their primary region stored on users.territory_id
+    without a row in manager_region_assignments. Use that legacy value only when the
+    Manager has no active assignment rows; explicit assignments remain authoritative.
+    """
     row = db.execute(
         text("""
             SELECT 1
@@ -99,17 +105,71 @@ def manager_manages_region(db: Session, manager_id: str, territory_id: str, orga
             "territory_id": territory_id,
         },
     ).first()
-    return row is not None
+    if row is not None:
+        return True
+
+    legacy_row = db.execute(
+        text("""
+            SELECT 1
+            FROM users manager
+            JOIN territories t
+              ON t.id = manager.territory_id
+             AND t.organization_id = manager.organization_id
+            WHERE manager.id = :manager_id
+              AND manager.organization_id = :organization_id
+              AND manager.role = 'MANAGER'
+              AND manager.is_active = true
+              AND manager.territory_id = :territory_id
+              AND t.is_active = true
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM manager_region_assignments mra
+                  WHERE mra.organization_id = manager.organization_id
+                    AND mra.manager_id = manager.id
+                    AND mra.is_active = true
+              )
+            LIMIT 1
+        """),
+        {
+            "organization_id": organization_id,
+            "manager_id": manager_id,
+            "territory_id": territory_id,
+        },
+    ).first()
+    return legacy_row is not None
 
 
 def manager_managed_regions(db: Session, manager_id: str, organization_id: str) -> list[str]:
     rows = db.execute(
         text("""
-            SELECT territory_id
-            FROM manager_region_assignments
-            WHERE organization_id = :organization_id
-              AND manager_id = :manager_id
-              AND is_active = true
+            SELECT mra.territory_id
+            FROM manager_region_assignments mra
+            JOIN territories t
+              ON t.id = mra.territory_id
+             AND t.organization_id = mra.organization_id
+            WHERE mra.organization_id = :organization_id
+              AND mra.manager_id = :manager_id
+              AND mra.is_active = true
+              AND t.is_active = true
+            UNION
+            SELECT manager.territory_id
+            FROM users manager
+            JOIN territories t
+              ON t.id = manager.territory_id
+             AND t.organization_id = manager.organization_id
+            WHERE manager.id = :manager_id
+              AND manager.organization_id = :organization_id
+              AND manager.role = 'MANAGER'
+              AND manager.is_active = true
+              AND manager.territory_id IS NOT NULL
+              AND t.is_active = true
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM manager_region_assignments mra
+                  WHERE mra.organization_id = manager.organization_id
+                    AND mra.manager_id = manager.id
+                    AND mra.is_active = true
+              )
         """),
         {"organization_id": organization_id, "manager_id": manager_id},
     ).scalars().all()
@@ -182,13 +242,32 @@ def get_region_directory(
         if not allowed_ids:
             return {"status": "success", "count": 0, "regions": []}
         region_filter = """
-            AND EXISTS (
-                SELECT 1
-                FROM manager_region_assignments mra_filter
-                WHERE mra_filter.organization_id = t.organization_id
-                  AND mra_filter.territory_id = t.id
-                  AND mra_filter.manager_id = :current_manager_id
-                  AND mra_filter.is_active = true
+            AND (
+                EXISTS (
+                    SELECT 1
+                    FROM manager_region_assignments mra_filter
+                    WHERE mra_filter.organization_id = t.organization_id
+                      AND mra_filter.territory_id = t.id
+                      AND mra_filter.manager_id = :current_manager_id
+                      AND mra_filter.is_active = true
+                )
+                OR (
+                    t.id = (
+                        SELECT manager.territory_id
+                        FROM users manager
+                        WHERE manager.id = :current_manager_id
+                          AND manager.organization_id = t.organization_id
+                          AND manager.role = 'MANAGER'
+                          AND manager.is_active = true
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM manager_region_assignments mra_legacy
+                        WHERE mra_legacy.organization_id = t.organization_id
+                          AND mra_legacy.manager_id = :current_manager_id
+                          AND mra_legacy.is_active = true
+                    )
+                )
             )
         """
         params["current_manager_id"] = str(current_user["id"])

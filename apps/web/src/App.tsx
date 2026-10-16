@@ -1967,7 +1967,12 @@ function SalesHome({ dashboard, tasks, alerts, visits, onGo, user }: any) {
         eyebrow="FIELD INTELLIGENCE"
         title={`Good ${new Date().getHours() < 12 ? "morning" : new Date().getHours() < 17 ? "afternoon" : "evening"}, ${user?.full_name?.split(" ")[0] || "Rep"}.`}
         sub="Your field intelligence workspace — real-time data from your visits, voice notes, and AI analysis."
-        action={<button className="button primary" onClick={() => onGo("record")}><Mic size={14} /> New Visit</button>}
+        action={
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="button ghost" onClick={() => onGo("customers")}><Plus size={14} /> New Customer</button>
+            <button className="button primary" onClick={() => onGo("record")}><Mic size={14} /> New Visit</button>
+          </div>
+        }
       />
       <div className="metric-grid">
         <div className="metric-card" style={{ cursor: "pointer" }} onClick={() => onGo("visits")}>
@@ -3747,7 +3752,7 @@ async function resubmitSelected() {
 function CustomersView({ customers, onGo, onOpenCustomer, onStartVisit, canStartVisit = true, user, teamUsers = [], onRefresh, onNotify }: any) {
   const [search, setSearch] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
-  const isManagementRole = ["MANAGER", "EXECUTIVE"].includes(String(user?.role || "").toUpperCase());
+  const isManagementRole = ["MANAGER", "EXECUTIVE", "FIELD_REP", "SALESPERSON"].includes(String(user?.role || "").toUpperCase());
   const filtered = customers.filter((c: ApiCustomer) =>
     c.name.toLowerCase().includes(search.toLowerCase()) ||
     (c.city || "").toLowerCase().includes(search.toLowerCase()) ||
@@ -6489,11 +6494,6 @@ function TerritoryView({ customers = [] }: { customers?: ApiCustomer[] }) {
       .map(([city, count]) => ({ city, customers: count }));
   }, [customers]);
 
-  const pipelineValue = useMemo(
-    () => mapLeads.reduce((sum, lead) => sum + Number(lead.value || 0), 0),
-    [mapLeads]
-  );
-
   const fieldRepMarker = (rep: LiveRepLocation) => {
     if (!rep.has_location || rep.latitude == null || rep.longitude == null) return null;
     return (
@@ -6728,22 +6728,6 @@ function TerritoryView({ customers = [] }: { customers?: ApiCustomer[] }) {
           )}
         </div>
 
-        <div className="panel territory-signal-card">
-          <div className="territory-section-title">
-            <div><span className="territory-kicker">COMMERCIAL SIGNAL</span><h3>Opportunity snapshot</h3></div>
-            <Target size={16} />
-          </div>
-          <div className="territory-signal-hero">
-            <span>Aggregate lead value in your visible scope</span>
-            <strong>{money(pipelineValue)}</strong>
-          </div>
-          <div className="territory-signal-grid">
-            <div><span>Mapped customers</span><strong>{mappedCustomers.length}</strong></div>
-            <div><span>Heat points</span><strong>{heatPoints.length}</strong></div>
-            <div><span>Live reps</span><strong>{liveRepCount}</strong></div>
-            <div><span>Open conflicts</span><strong className={conflictCount ? "danger" : "good"}>{conflictCount}</strong></div>
-          </div>
-        </div>
       </section>
 
       <section className="panel territory-explainer">
@@ -8366,7 +8350,8 @@ function EmailView({ report, onGo, user }: { report: Report; onGo: (v: View) => 
 
       {/* Back to dashboard */}
       <div style={{ textAlign: "center", marginTop: 18 }}>
-        <button className="button ghost" onClick={() => onGo("home")}>← Return to dashboard</button>
+        <button className="button ghost" onClick={() => onGo("home")}>← Return to Dashboard </button>
+      
       </div>
     </>
   );
