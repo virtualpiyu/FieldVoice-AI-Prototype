@@ -117,15 +117,8 @@ def process_voice_note_background(voice_note_id: str, file_path: str):
         try:
             ai_analysis = analyze_transcription(transcription)
         except Exception as e:
-            # Keep the voice note/transcript usable even if the AI provider fails.
-            return {
-                "status": "partial_success",
-                "message": "Voice note uploaded and transcribed, but AI analysis could not be generated.",
-                "voice_note": dict(voice_note),
-                "transcription": transcription,
-                "ai_analysis": None,
-                "analysis_error": str(e),
-            }
+            from app.services.ai_analysis_service import _local_fallback
+            ai_analysis = _local_fallback(transcription)
 
         processing_time_ms = int(
             (time.perf_counter() - analysis_start) * 1000

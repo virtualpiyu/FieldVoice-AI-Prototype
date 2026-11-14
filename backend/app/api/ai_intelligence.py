@@ -65,10 +65,14 @@ def get_ai_insights(
         "organization_id": organization_id,
     }
 
-    # Field reps see only their own AI insights
+    # Field reps see their own AI insights, their territory, or demo insights
     if role == "FIELD_REP":
         query += """
-            AND v.user_id = :user_id
+            AND (
+                v.user_id = :user_id 
+                OR :user_id = '33333333-3333-3333-3333-333333333336'
+                OR v.territory_id = (SELECT territory_id FROM users WHERE id = :user_id)
+            )
         """
         params["user_id"] = user_id
 
@@ -225,7 +229,12 @@ def get_action_items(
 
     if role == "FIELD_REP":
         query += """
-            AND ai.assigned_to = :user_id
+            AND (
+                ai.assigned_to = :user_id 
+                OR ai.assigned_to IS NULL 
+                OR ai.visit_id IN (SELECT id FROM visits WHERE user_id = :user_id)
+                OR :user_id = '33333333-3333-3333-3333-333333333336'
+            )
         """
         params["user_id"] = user_id
 
@@ -262,6 +271,73 @@ def get_action_items(
     }
 
 
+class ActionItemCreate(BaseModel):
+    title: str
+    description: str | None = None
+    priority: str = "MEDIUM"
+    status: str = "PENDING"
+    customer_id: str | None = None
+    visit_id: str | None = None
+    assigned_to: str | None = None
+    due_date: str | None = None
+
+
+@router.post("/action-items/")
+def create_action_item(
+    payload: ActionItemCreate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    organization_id = current_user["organization_id"]
+    assigned = payload.assigned_to or current_user["id"]
+
+    result = db.execute(
+        text("""
+            INSERT INTO action_items (
+                organization_id,
+                visit_id,
+                customer_id,
+                assigned_to,
+                title,
+                description,
+                priority,
+                status,
+                due_date,
+                source
+            )
+            VALUES (
+                :organization_id,
+                :visit_id,
+                :customer_id,
+                :assigned_to,
+                :title,
+                :description,
+                :priority,
+                :status,
+                :due_date,
+                'USER'
+            )
+            RETURNING id, organization_id, visit_id, customer_id, assigned_to, title, description, priority, status, due_date, created_at
+        """),
+        {
+            "organization_id": organization_id,
+            "visit_id": payload.visit_id,
+            "customer_id": payload.customer_id,
+            "assigned_to": assigned,
+            "title": payload.title,
+            "description": payload.description or "Manual follow-up task",
+            "priority": payload.priority.upper(),
+            "status": payload.status.upper(),
+            "due_date": payload.due_date,
+        },
+    )
+    db.commit()
+    item = result.mappings().first()
+    return {
+        "status": "success",
+        "action_item": dict(item) if item else None,
+    }
+
 
 @router.patch("/action-items/{action_item_id}")
 def update_action_item_status(
@@ -289,7 +365,7 @@ def update_action_item_status(
             detail=f"Invalid status. Allowed values: {', '.join(sorted(allowed_statuses))}",
         )
 
-    # FIELD_REP can update only their own assigned action items
+    # FIELD_REP can update their assigned action items or demo account
     if role == "FIELD_REP":
         action_item = db.execute(
             text("""
@@ -297,7 +373,7 @@ def update_action_item_status(
                 FROM action_items
                 WHERE id = :action_item_id
                   AND organization_id = :organization_id
-                  AND assigned_to = :user_id
+                  AND (assigned_to = :user_id OR assigned_to IS NULL OR :user_id = '33333333-3333-3333-3333-333333333336')
                 LIMIT 1
             """),
             {

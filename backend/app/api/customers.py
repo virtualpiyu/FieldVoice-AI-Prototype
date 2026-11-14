@@ -6,6 +6,26 @@ from app.database import get_db
 from app.core.dependencies import get_current_user, require_role
 
 
+from pydantic import BaseModel
+
+
+class CustomerCreatePayload(BaseModel):
+    name: str | None = None
+    territory_id: str | None = None
+    contact_person: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    address: str | None = None
+    city: str | None = None
+    state: str | None = None
+    country: str | None = "India"
+    latitude: float | None = None
+    longitude: float | None = None
+    industry: str | None = None
+    status_value: str | None = "ACTIVE"
+    notes: str | None = None
+
+
 router = APIRouter(
     prefix="/customers",
     tags=["Customers"],
@@ -19,7 +39,7 @@ router = APIRouter(
 
 @router.post("/")
 def create_customer(
-    name: str,
+    name: str | None = None,
     territory_id: str | None = None,
     contact_person: str | None = None,
     email: str | None = None,
@@ -33,9 +53,31 @@ def create_customer(
     industry: str | None = None,
     status_value: str = "ACTIVE",
     notes: str | None = None,
+    body: CustomerCreatePayload | None = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    eff_name = (body.name if body and body.name else name) or ""
+    if not eff_name.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Customer name is required.",
+        )
+    name = eff_name
+    territory_id = (body.territory_id if body and body.territory_id else territory_id)
+    contact_person = (body.contact_person if body and body.contact_person else contact_person)
+    email = (body.email if body and body.email else email)
+    phone = (body.phone if body and body.phone else phone)
+    address = (body.address if body and body.address else address)
+    city = (body.city if body and body.city else city)
+    state = (body.state if body and body.state else state)
+    country = (body.country if body and body.country else country)
+    latitude = (body.latitude if body and body.latitude is not None else latitude)
+    longitude = (body.longitude if body and body.longitude is not None else longitude)
+    industry = (body.industry if body and body.industry else industry)
+    status_value = (body.status_value if body and body.status_value else status_value)
+    notes = (body.notes if body and body.notes else notes)
+
     organization_id = str(current_user["organization_id"])
     current_user_id = str(current_user["id"])
     actor_role = str(current_user.get("role") or "").strip().upper()

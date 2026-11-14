@@ -77,6 +77,10 @@ app.include_router(organization_management_router)
 #live Teritories location
 app.include_router(territory_live_router)
 
+import os
+
+os.makedirs("app/uploads/voice_notes", exist_ok=True)
+
 # Static files for upload Voice notes 
 app.mount(
     "/uploads",

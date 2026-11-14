@@ -14,9 +14,21 @@ router = APIRouter(
 )
 
 
+class VisitCreatePayload(BaseModel):
+    customer_id: str | None = None
+    territory_id: str | None = None
+    visit_date: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    location_accuracy_m: float | None = None
+    visit_type: str | None = "CUSTOMER_VISIT"
+    status_value: str | None = "IN_PROGRESS"
+    notes: str | None = None
+
+
 @router.post("/")
 def create_visit(
-    customer_id: str,
+    customer_id: str | None = None,
     territory_id: str | None = None,
     visit_date: str | None = None,
     latitude: float | None = None,
@@ -25,9 +37,26 @@ def create_visit(
     visit_type: str = "CUSTOMER_VISIT",
     status_value: str = "IN_PROGRESS",
     notes: str | None = None,
+    body: VisitCreatePayload | None = None,
     current_user: dict = Depends(require_role("FIELD_REP", "MANAGER", "EXECUTIVE")),
     db: Session = Depends(get_db),
 ):
+    eff_customer_id = (body.customer_id if body and body.customer_id else customer_id) or ""
+    if not eff_customer_id.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Customer ID is required.",
+        )
+    customer_id = eff_customer_id
+    territory_id = (body.territory_id if body and body.territory_id else territory_id)
+    visit_date = (body.visit_date if body and body.visit_date else visit_date)
+    latitude = (body.latitude if body and body.latitude is not None else latitude)
+    longitude = (body.longitude if body and body.longitude is not None else longitude)
+    location_accuracy_m = (body.location_accuracy_m if body and body.location_accuracy_m is not None else location_accuracy_m)
+    visit_type = (body.visit_type if body and body.visit_type else visit_type)
+    status_value = (body.status_value if body and body.status_value else status_value)
+    notes = (body.notes if body and body.notes else notes)
+
     organization_id = current_user["organization_id"]
     user_id = current_user["id"]
     role = str(current_user.get("role") or "").strip().upper()

@@ -16,6 +16,14 @@ from app.core.dependencies import get_current_user
 
 
 
+from pydantic import BaseModel
+
+
+class LoginPayload(BaseModel):
+    email: str | None = None
+    password: str | None = None
+
+
 router = APIRouter(
     prefix="/auth",
     tags=["Authentication"],
@@ -24,10 +32,20 @@ router = APIRouter(
 
 @router.post("/login")
 def login(
-    email: str,
-    password: str,
+    email: str | None = None,
+    password: str | None = None,
+    body: LoginPayload | None = None,
     db: Session = Depends(get_db),
 ):
+    eff_email = (body.email if body and body.email else email) or ""
+    eff_password = (body.password if body and body.password else password) or ""
+
+    if not eff_email or not eff_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email and password are required.",
+        )
+
     # Find user
     query = text("""
         SELECT
@@ -46,7 +64,7 @@ def login(
 
     result = db.execute(
         query,
-        {"email": email},
+        {"email": eff_email},
     )
 
     user = result.mappings().first()
@@ -74,7 +92,7 @@ def login(
 
     # Verify password
     if not verify_password(
-        password,
+        eff_password,
         user["password_hash"],
     ):
         raise HTTPException(

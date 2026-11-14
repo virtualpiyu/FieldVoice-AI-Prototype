@@ -10,20 +10,20 @@
     "web": "expo start --web"
   },
   "dependencies": {
-    "@expo/metro-runtime": "~57.0.16",
+    "@expo/metro-runtime": "~58.0.17",
     "@expo/vector-icons": "^15.0.2",
-    "expo": "~57.0.27",
-    "expo-asset": "~57.0.19",
-    "expo-audio": "~57.0.5",
-    "expo-font": "~57.0.4",
-    "expo-status-bar": "~57.0.1",
-    "react": "19.2.3",
-    "react-dom": "19.2.3",
-    "react-native": "0.86.3",
+    "expo": "^58.0.25",
+    "expo-asset": "~58.0.21",
+    "expo-audio": "~58.0.12",
+    "expo-font": "~58.0.12",
+    "expo-status-bar": "~58.0.5",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-native": "0.88.1",
     "react-native-web": "^0.21.2"
   },
   "devDependencies": {
-    "@types/react": "~19.2.4",
+    "@types/react": "~19.3.0",
     "typescript": "~6.0.3"
   }
 }
